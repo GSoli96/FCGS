@@ -41,6 +41,18 @@ class TrustedAuthority:
             context.make_context_public()
             self.ckks_public_context_bytes = context.serialize(save_secret_key=False)
             self.logger.info("CKKS context generated successfully.")
+        elif he_backend == 'bfv':
+            self.logger.info("Generating TenSEAL BFV context (poly_modulus_degree=4096)...")
+            import tenseal as ts
+            context = ts.context(
+                ts.SCHEME_TYPE.BFV,
+                poly_modulus_degree=4096,
+                plain_modulus=7340033
+            )
+            self.ckks_full_context_bytes = context.serialize(save_secret_key=True)
+            context.make_context_public()
+            self.ckks_public_context_bytes = context.serialize(save_secret_key=False)
+            self.logger.info("BFV context generated successfully.")
         else:
             self.logger.info("Generating Paillier keypair with n_length=%d...", key_length)
             self.pubkey, self.privkey = paillier.generate_paillier_keypair(n_length=key_length)
@@ -97,9 +109,9 @@ class TrustedAuthority:
     def _on_request_keys(self):
         """Handles a client's request for keys and sends them back."""
         self.logger.info("Received key request from client %s. Distributing keys.", request.sid)
-        if self.he_backend == 'ckks':
+        if self.he_backend in ('ckks', 'bfv'):
             emit('distribute_keys', {
-                'backend': 'ckks',
+                'backend': self.he_backend,
                 'full_context': codecs.encode(self.ckks_full_context_bytes, 'base64').decode(),
                 'public_context': codecs.encode(self.ckks_public_context_bytes, 'base64').decode(),
             })

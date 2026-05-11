@@ -251,3 +251,92 @@ def multiply_encrypted_weights_ckks_by_scalar(
         chunks = [(ts.ckks_vector_from(context, c) * scalar).serialize() for c in item['chunks']]
         result.append({'shape': item['shape'], 'chunks': chunks, 'size': item['size']})
     return result
+
+
+# --- BFV (TenSEAL) functions ---
+# BFV e' uno schema esatto su interi: i float vengono quantizzati con un fattore di scala
+# prima della cifratura e de-quantizzati dopo la decifrazione.
+# poly_modulus_degree=4096 → 2048 slot per ciphertext
+
+_BFV_MAX_SLOTS = 2048
+
+
+def encrypt_weights_bfv(
+        context: Any,
+        weights: List[np.ndarray],
+        scale: int = 1000,
+        logger: logging.Logger = log
+) -> List[Dict[str, Any]]:
+    """
+    Encrypts model weights using TenSEAL BFV integer vectors.
+    Floats are quantized by multiplying by `scale` and rounding to integers.
+    """
+    import tenseal as ts
+    encrypted = []
+    num_layers = len(weights)
+    logger.info("Starting BFV encryption of %d layers (scale=%d, max_slots=%d)...",
+                num_layers, scale, _BFV_MAX_SLOTS)
+    for i, layer in enumerate(weights):
+        flat = layer.flatten().tolist()
+        flat_int = [round(x * scale) for x in flat]
+        chunks = [flat_int[j:j + _BFV_MAX_SLOTS] for j in range(0, len(flat_int), _BFV_MAX_SLOTS)]
+        enc_chunks = [ts.bfv_vector(context, chunk).serialize() for chunk in chunks]
+        encrypted.append({'shape': layer.shape, 'chunks': enc_chunks, 'size': len(flat), 'scale': scale})
+        logger.info("BFV encryption: layer %d/%d done", i + 1, num_layers)
+    logger.info("BFV encryption complete.")
+    return encrypted
+
+
+def decrypt_weights_bfv(
+        context: Any,
+        encrypted_weights: List[Dict[str, Any]],
+        logger: logging.Logger = log
+) -> List[np.ndarray]:
+    """Decrypts BFV-encrypted weights and de-quantizes back to floats."""
+    import tenseal as ts
+    decrypted = []
+    num_layers = len(encrypted_weights)
+    logger.info("Starting BFV decryption of %d layers...", num_layers)
+    for i, item in enumerate(encrypted_weights):
+        scale = item['scale']
+        flat_int = []
+        for chunk_bytes in item['chunks']:
+            flat_int.extend(ts.bfv_vector_from(context, chunk_bytes).decrypt())
+        flat_float = [x / scale for x in flat_int[:item['size']]]
+        decrypted.append(np.array(flat_float, dtype=np.float32).reshape(item['shape']))
+        logger.info("BFV decryption: layer %d/%d done", i + 1, num_layers)
+    logger.info("BFV decryption complete.")
+    return decrypted
+
+
+def sum_encrypted_weights_bfv(
+        context: Any,
+        weights_a: List[Dict[str, Any]],
+        weights_b: List[Dict[str, Any]]
+) -> List[Dict[str, Any]]:
+    """Homomorphically adds two lists of BFV-encrypted weights."""
+    import tenseal as ts
+    result = []
+    for a, b in zip(weights_a, weights_b):
+        chunks = []
+        for ca, cb in zip(a['chunks'], b['chunks']):
+            va = ts.bfv_vector_from(context, ca)
+            vb = ts.bfv_vector_from(context, cb)
+            chunks.append((va + vb).serialize())
+        result.append({'shape': a['shape'], 'chunks': chunks, 'size': a['size'], 'scale': a['scale']})
+    return result
+
+
+def multiply_encrypted_weights_bfv_by_scalar(
+        context: Any,
+        weights: List[Dict[str, Any]],
+        scalar: Union[int, float]
+) -> List[Dict[str, Any]]:
+    """Homomorphically multiplies BFV-encrypted weights by an integer scalar (train_size)."""
+    import tenseal as ts
+    int_scalar = round(scalar)
+    result = []
+    for item in weights:
+        chunks = [(ts.bfv_vector_from(context, c) * int_scalar).serialize() for c in item['chunks']]
+        result.append({'shape': item['shape'], 'chunks': chunks, 'size': item['size'], 'scale': item['scale']})
+    return result

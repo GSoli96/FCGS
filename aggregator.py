@@ -9,7 +9,8 @@ import logging
 # --- MODIFICA CHIAVE: Import corretto ---
 from model_manager import ModelManager
 from utils import (sum_encrypted_weights, multiply_encrypted_weights_by_scalar,
-                   sum_encrypted_weights_ckks, multiply_encrypted_weights_ckks_by_scalar)
+                   sum_encrypted_weights_ckks, multiply_encrypted_weights_ckks_by_scalar,
+                   sum_encrypted_weights_bfv, multiply_encrypted_weights_bfv_by_scalar)
 
 
 class Aggregator:
@@ -79,8 +80,18 @@ class Aggregator:
         client_sizes = [update['train_size'] for update in round_client_updates]
         first_weights = round_client_updates[0]['weights']
 
-        if first_weights and isinstance(first_weights[0], dict) and 'chunks' in first_weights[0]:
-            # CKKS backend
+        first_layer = first_weights[0] if first_weights else {}
+        if isinstance(first_layer, dict) and 'scale' in first_layer:
+            # BFV backend (exact integer arithmetic, float quantizzati)
+            import tenseal as ts
+            context = ts.context_from(ckks_public_context_bytes)
+            summed = multiply_encrypted_weights_bfv_by_scalar(context, first_weights, client_sizes[0])
+            for i in range(1, len(round_client_updates)):
+                weighted = multiply_encrypted_weights_bfv_by_scalar(
+                    context, round_client_updates[i]['weights'], client_sizes[i])
+                summed = sum_encrypted_weights_bfv(context, summed, weighted)
+        elif isinstance(first_layer, dict) and 'chunks' in first_layer:
+            # CKKS backend (approssimato, float nativi)
             import tenseal as ts
             context = ts.context_from(ckks_public_context_bytes)
             summed = multiply_encrypted_weights_ckks_by_scalar(context, first_weights, client_sizes[0])

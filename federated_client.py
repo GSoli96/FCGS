@@ -10,7 +10,8 @@ import threading
 from model_manager import ModelManager
 from utils import (object_to_pickle_string, pickle_string_to_object,
                    encrypt_weights, decrypt_weights,
-                   encrypt_weights_ckks, decrypt_weights_ckks)
+                   encrypt_weights_ckks, decrypt_weights_ckks,
+                   encrypt_weights_bfv, decrypt_weights_bfv)
 
 
 class ContextFilter(logging.Filter):
@@ -98,7 +99,9 @@ class FederatedClient:
                 return None
             try:
                 self.logger.info("Data is in dictionary format, attempting decryption (%s).", self.he_backend)
-                if self.he_backend == 'ckks':
+                if self.he_backend == 'bfv':
+                    plaintext_sum = decrypt_weights_bfv(self.ckks_context, weights_data, logger=self.logger)
+                elif self.he_backend == 'ckks':
                     plaintext_sum = decrypt_weights_ckks(self.ckks_context, weights_data, logger=self.logger)
                 else:
                     plaintext_sum = decrypt_weights(self.paillier_privkey, weights_data, logger=self.logger)
@@ -239,7 +242,9 @@ class FederatedClient:
             local_weights = self.local_model.get_weights()
 
             if self.encryption_mode != 'no_encryption':
-                if self.he_backend == 'ckks':
+                if self.he_backend == 'bfv':
+                    weights_to_send = encrypt_weights_bfv(self.ckks_context, local_weights, logger=self.logger)
+                elif self.he_backend == 'ckks':
                     weights_to_send = encrypt_weights_ckks(self.ckks_context, local_weights, logger=self.logger)
                 else:
                     weights_to_send = encrypt_weights(self.paillier_pubkey, local_weights,
