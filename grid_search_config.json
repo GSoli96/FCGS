@@ -1,6 +1,12 @@
 {
   "ip_address": "127.0.0.1",
   "port": 5001,
+  "telegram_bot_token": "8779083388:AAE9m7dlXSm2ql1kYsqcwcNy34pNYUSYFuo",
+  "telegram_chat_id": "139781098",
+  "notification_interval": 100,
+  "heartbeat_interval_hours": 4,
+  "gpu_blacklist": [],
+  "num_parallel_executions": 12,
   "base_csv_path": "csv",
   "base_log_path": "logs",
   "base_plot_path": "static/plots",
@@ -87,12 +93,41 @@
       "name": "dataset_multy_sorted_Flair",
       "path": "dataset/dataset_multy_sorted_Flair",
       "num_classes": 3
+    },
+    {
+      "name": "brain_tumor",
+      "path": "dbluigi/brain_tumor/train",
+      "num_classes": 4
+    },
+    {
+      "name": "dataset_HAM1000",
+      "path": "dbluigi/dataset_HAM1000/dataset",
+      "num_classes": 2
+    },
+    {
+      "name": "dataset_ISIC",
+      "path": "dbluigi/dataset_ISIC/dataset",
+      "num_classes": 2
+    },
+    {
+      "name": "dataset_ISIC2",
+      "path": "dbluigi/dataset_ISIC2",
+      "num_classes": 2
+    },
+    {
+      "name": "dataset_RD_colored",
+      "path": "dbluigi/dataset_RD/colored_images",
+      "num_classes": 5
+    },
+    {
+      "name": "dataset_RD_kdr299",
+      "path": "dbluigi/dataset_RD/kdr299_iimp",
+      "num_classes": 5
     }
   ],
   "common_search_space": {
     "encryption_mode": [
-      "no_encryption",
-      "direct_encrypted_update"
+      "no_encryption"
     ],
     "device": [
       "cuda"

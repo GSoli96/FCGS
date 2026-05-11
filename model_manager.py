@@ -1,5 +1,8 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
+from PIL import ImageFile
+ImageFile.LOAD_TRUNCATED_IMAGES = True
 import torchvision.models as models
 import torchvision.transforms as transforms
 from torch.utils.data import DataLoader
@@ -23,13 +26,10 @@ class ConvNet(torch.nn.Module):
         self.fc3 = torch.nn.Linear(hidden2, num_classes)
 
     def forward(self, x):
-        x = self.conv1(x);
-        x = x * x
+        x = F.relu(self.conv1(x))
         x = x.view(x.size(0), -1)
-        x = self.fc1(x);
-        x = x * x
-        x = self.fc2(x);
-        x = x * x
+        x = F.relu(self.fc1(x))
+        x = F.relu(self.fc2(x))
         x = self.fc3(x)
         return x
 
@@ -53,8 +53,8 @@ class ModelManager:
     def _get_device(self, device_str: str) -> torch.device:
         if device_str == 'cuda' and torch.cuda.is_available():
             num_gpus = torch.cuda.device_count()
-            # GPU 1 è usata dal display server, la saltiamo
-            usable_gpus = [i for i in range(num_gpus) if i != 1]
+            blacklist = self.config.get('gpu_blacklist', [])
+            usable_gpus = [i for i in range(num_gpus) if i not in blacklist]
             if usable_gpus:
                 worker_id = self.config.get('worker_id', 0) or 0
                 gpu_index = usable_gpus[worker_id % len(usable_gpus)]
@@ -294,11 +294,15 @@ class ModelManager:
         all_preds, all_labels = [], []
         running_loss = 0.0
 
+        algorithm = self.config.get('algorithm', 'FedAvg')
         with torch.no_grad():
             for images, labels in data_loader:
                 images, labels = images.to(self.device), labels.to(self.device)
                 outputs = self.model(images)
-                loss = self.criterion(outputs, labels)
+                if algorithm == 'FedLC':
+                    loss = self.criterion(outputs - self.calibration_term.unsqueeze(0), labels)
+                else:
+                    loss = self.criterion(outputs, labels)
                 running_loss += loss.item() * images.size(0)
                 _, preds = torch.max(outputs, 1)
                 all_preds.extend(preds.cpu().numpy())

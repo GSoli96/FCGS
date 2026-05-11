@@ -5,7 +5,7 @@ import os
 import numpy as np
 import json
 from typing import Dict, List, Set, Any
-from threading import Lock
+from threading import Lock, Thread
 from flask import Flask, request, render_template
 from flask_socketio import SocketIO, emit
 
@@ -47,6 +47,7 @@ class FederatedServer:
         self.client_evaluations_this_round: List[Dict] = []
         self.client_metrics_buffer: List[Dict] = []  # For 'metrics_first' strategy
         self.total_training_size_in_round: int = 0
+        self.expected_eval_count: int = 0
 
         self.aggregator = Aggregator(self.config, self.logger)
 
@@ -135,8 +136,11 @@ class FederatedServer:
         self.client_metrics_buffer.clear()
 
         all_available_clients = list(self.registered_clients)
-        print("NUM CLIENT SPLIT:",all_available_clients, self.min_num_workers)
-        selected_clients = random.sample(all_available_clients, self.min_num_workers)
+        k = min(self.min_num_workers, len(all_available_clients))
+        if k == 0:
+            self.logger.error("No clients available to start a round. Aborting.")
+            return
+        selected_clients = random.sample(all_available_clients, k)
 
         self.num_clients_per_round = len(selected_clients)
 
@@ -158,6 +162,7 @@ class FederatedServer:
         """Sends the aggregated model to all clients for evaluation."""
         self.logger.info("Triggering global model evaluation on all %d clients.", len(self.registered_clients))
         self.client_evaluations_this_round.clear()
+        self.expected_eval_count = len(self.registered_clients)
 
         data_to_send = {
             'batch_size': self.config['batch_size'],
@@ -191,18 +196,12 @@ class FederatedServer:
             self.aggregator.aggregate_train_loss(train_losses, self.current_round)
 
     def _shutdown_server(self):
-        """Shuts down the Werkzeug server. Note: For development use only."""
-        # self.logger.info("Shutting down the server.")
-        ta_address = f"http://{self.config['ip_address']}:{self.config['ta_port']}"
-        emit('shutdown', {'ta_address': ta_address})
-        time.sleep(1)
-        # func = request.environ.get('werkzeug.server.shutdown')
-        # if func is None:
-        #     self.logger.error('Cannot shut down server. Not running with the Werkzeug Server.')
-        #     return
-        # func()
+        """Shuts down the server from a background thread to avoid deadlock."""
         self.logger.info("Shutting down the server.")
-        self.socketio.stop()
+        def _do_stop():
+            time.sleep(0.5)
+            self.socketio.stop()
+        Thread(target=_do_stop, daemon=True).start()
 
     # --- SocketIO Event Handlers ---
 
@@ -296,7 +295,7 @@ class FederatedServer:
             self.logger.info("Received evaluation from client %s.", request.sid)
             self.client_evaluations_this_round.append(data)
 
-            if len(self.client_evaluations_this_round) >= len(self.registered_clients):
+            if len(self.client_evaluations_this_round) >= self.expected_eval_count:
                 self.logger.info("All evaluations received for round %d. Aggregating evaluation metrics.",
                                  self.current_round)
 

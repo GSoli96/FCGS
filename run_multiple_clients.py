@@ -14,10 +14,6 @@ def load_json(filename: str) -> Dict:
 
 
 def start_client_thread(config: Dict, dataset_path: str) -> None:
-    """
-    Initializes and runs a FederatedClient in a separate thread.
-    """
-    print(f"Starting client for dataset: {dataset_path}")
     try:
         FederatedClient(config, dataset_path)
     except Exception as e:
@@ -34,14 +30,12 @@ def main(config: Dict) -> None:
     splitting_dir = config['splitting_dir']
     source_images_dir = config['dataset_path'] # <-- Modifica chiave
 
-    print(f"Preparing to split the dataset from '{source_images_dir}' for {num_clients} clients into '{splitting_dir}'.")
     splitter = DatasetSplitter(
         output_base_dir=splitting_dir,
         source_images_dir=source_images_dir,
         num_clients=num_clients
     )
     splitter.split_dataset()
-    print("Dataset splitting complete.")
 
     threads: List[threading.Thread] = []
     for i in range(num_clients):
@@ -56,8 +50,6 @@ def main(config: Dict) -> None:
 
     for thread in threads:
         thread.join()
-
-    print("All client threads have finished.")
 
 
 if __name__ == '__main__':

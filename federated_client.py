@@ -43,7 +43,9 @@ class FederatedClient:
             self.paillier_privkey = None
             self.keys_received_event = threading.Event()
 
-        self.sio = socketio.Client(logger=True, request_timeout=10, reconnection=True)
+        self._training_active = threading.Event()
+
+        self.sio = socketio.Client(logger=False, engineio_logger=False, request_timeout=10, reconnection=True)
         self._register_event_handlers()
         self.connect_to_server()
 
@@ -119,7 +121,7 @@ class FederatedClient:
             self.sio.wait()
         except socketio.exceptions.ConnectionError as e:
             self.logger.error("Failed to connect to the server: %s", e)
-            exit(1)
+            return
 
     def _register_event_handlers(self) -> None:
         self.sio.on('connect', self._on_connect)
@@ -140,7 +142,7 @@ class FederatedClient:
     def _on_reconnect(self):
         self.logger.info("Reconnected to the server.")
 
-    def _on_shutdown(self):
+    def _on_shutdown(self, data=None):
         self.logger.info("Received shutdown signal."); self.sio.disconnect()
 
     def _on_init(self, data: Dict):
@@ -163,10 +165,12 @@ class FederatedClient:
                 ta_sio.emit('request_keys')
                 if not self.keys_received_event.wait(timeout=30):
                     self.logger.error("CRITICAL: Did not receive keys from TA within timeout.")
-                    exit(1)
+                    self.sio.disconnect()
+                    return
             except Exception as e:
                 self.logger.error("CRITICAL: Failed to get keys from TA: %s", e)
-                exit(1)
+                self.sio.disconnect()
+                return
 
         self._initialize_model_and_report_ready()
 
@@ -190,6 +194,10 @@ class FederatedClient:
         self.local_model.set_calibration_term(calibration_val)
 
     def _on_request_update(self, data: Dict):
+        if self._training_active.is_set():
+            self.logger.warning("Training already in progress. Ignoring duplicate request for round %s.", data['round_number'])
+            return
+        self._training_active.set()
         self.logger.info("Received model update request for round %s. Starting worker thread.", data['round_number'])
         worker_thread = threading.Thread(target=self._update_worker, args=(data,))
         worker_thread.daemon = True
@@ -234,9 +242,14 @@ class FederatedClient:
 
         except Exception as e:
             self.logger.error("An error occurred in the update worker thread: %s", e, exc_info=True)
+        finally:
+            self._training_active.clear()
 
     def _on_stop_and_eval(self, data: Dict):
         self.logger.info("Received final aggregated model for evaluation.")
+        # Wait for any in-progress training to finish before touching model weights
+        while self._training_active.is_set():
+            time.sleep(0.1)
         final_weights = self._process_server_weights(data)
         if final_weights is None:
             self.logger.error("Evaluation failed: Could not process server weights.")
@@ -252,7 +265,3 @@ class FederatedClient:
         }
         self.logger.info("Sending final evaluation to the server.")
         self.sio.emit('client_eval', response)
-
-        if data.get('STOP', False):
-            self.logger.info("Federated training finished. Shutting down client.")
-            exit(0)
