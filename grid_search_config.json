@@ -129,6 +129,9 @@
     "encryption_mode": [
       "no_encryption"
     ],
+    "he_backend": [
+      "ckks"
+    ],
     "device": [
       "cuda"
     ],

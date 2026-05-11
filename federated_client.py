@@ -1,3 +1,4 @@
+import codecs
 import logging
 import time
 import os
@@ -6,9 +7,10 @@ import numpy as np
 from typing import Dict
 import threading
 
-# --- MODIFICA CHIAVE: Import corretto ---
 from model_manager import ModelManager
-from utils import object_to_pickle_string, pickle_string_to_object, encrypt_weights, decrypt_weights
+from utils import (object_to_pickle_string, pickle_string_to_object,
+                   encrypt_weights, decrypt_weights,
+                   encrypt_weights_ckks, decrypt_weights_ckks)
 
 
 class ContextFilter(logging.Filter):
@@ -37,10 +39,13 @@ class FederatedClient:
         self.logger: logging.LoggerAdapter = self._setup_logger()
 
         self.encryption_mode: str = self.config.get('encryption_mode', 'none')
+        self.he_backend: str = self.config.get('he_backend', 'paillier')
         if self.encryption_mode != 'no_encryption':
-            self.logger.info("Encryption enabled. Keys will be requested from the Trusted Authority.")
+            self.logger.info("Encryption enabled (%s). Keys will be requested from the Trusted Authority.", self.he_backend)
             self.paillier_pubkey = None
             self.paillier_privkey = None
+            self.ckks_context = None
+            self.ckks_public_context_bytes = None
             self.keys_received_event = threading.Event()
 
         self._training_active = threading.Event()
@@ -92,8 +97,11 @@ class FederatedClient:
                 self.logger.error("Received encrypted-format weights while in 'no_encryption' mode. Mismatch.")
                 return None
             try:
-                self.logger.info("Data is in dictionary format, attempting decryption.")
-                plaintext_sum = decrypt_weights(self.paillier_privkey, weights_data, logger=self.logger)
+                self.logger.info("Data is in dictionary format, attempting decryption (%s).", self.he_backend)
+                if self.he_backend == 'ckks':
+                    plaintext_sum = decrypt_weights_ckks(self.ckks_context, weights_data, logger=self.logger)
+                else:
+                    plaintext_sum = decrypt_weights(self.paillier_privkey, weights_data, logger=self.logger)
             except Exception as e:
                 self.logger.error("Error during weight decryption: %s", e, exc_info=True)
                 return None
@@ -154,9 +162,16 @@ class FederatedClient:
 
             @ta_sio.on('distribute_keys')
             def on_receive_keys(key_data):
-                self.logger.info("Keys received from Trusted Authority.")
-                self.paillier_pubkey = pickle_string_to_object(key_data['pubkey'])
-                self.paillier_privkey = pickle_string_to_object(key_data['privkey'])
+                self.logger.info("Keys received from Trusted Authority (backend=%s).", key_data.get('backend', 'paillier'))
+                if key_data.get('backend') == 'ckks':
+                    import tenseal as ts
+                    full_bytes = codecs.decode(key_data['full_context'].encode(), 'base64')
+                    pub_bytes = codecs.decode(key_data['public_context'].encode(), 'base64')
+                    self.ckks_context = ts.context_from(full_bytes)
+                    self.ckks_public_context_bytes = pub_bytes
+                else:
+                    self.paillier_pubkey = pickle_string_to_object(key_data['pubkey'])
+                    self.paillier_privkey = pickle_string_to_object(key_data['privkey'])
                 self.keys_received_event.set()
                 ta_sio.disconnect()
 
@@ -186,7 +201,10 @@ class FederatedClient:
         self.logger.info("Local model initialized. Calculating data stats...")
         samples_per_class = self.local_model.get_samples_per_class()
         self.logger.info("Stats calculated. Sending 'client_ready' to the main server.")
-        self.sio.emit('client_ready', {'samples_per_class': object_to_pickle_string(samples_per_class)})
+        ready_data = {'samples_per_class': object_to_pickle_string(samples_per_class)}
+        if self.encryption_mode != 'no_encryption' and self.he_backend == 'ckks':
+            ready_data['ckks_public_context'] = codecs.encode(self.ckks_public_context_bytes, 'base64').decode()
+        self.sio.emit('client_ready', ready_data)
 
     def _on_distribute_calibration(self, data: Dict):
         self.logger.info("Received static calibration term from the server.")
@@ -221,8 +239,11 @@ class FederatedClient:
             local_weights = self.local_model.get_weights()
 
             if self.encryption_mode != 'no_encryption':
-                weights_to_send = encrypt_weights(self.paillier_pubkey, local_weights,
-                                                  encryption_mode=self.encryption_mode, logger=self.logger)
+                if self.he_backend == 'ckks':
+                    weights_to_send = encrypt_weights_ckks(self.ckks_context, local_weights, logger=self.logger)
+                else:
+                    weights_to_send = encrypt_weights(self.paillier_pubkey, local_weights,
+                                                      encryption_mode=self.encryption_mode, logger=self.logger)
             else:
                 weights_to_send = local_weights
 

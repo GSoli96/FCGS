@@ -1,3 +1,4 @@
+import codecs
 import logging
 import random
 import time
@@ -55,6 +56,7 @@ class FederatedServer:
 
         self.client_stats_buffer: List[Dict] = []
         self.static_calibration_term: np.ndarray = None
+        self.ckks_public_context_bytes: bytes = None
 
         # --- Encryption ---
         self.encryption_mode: str = self.config.get('encryption_mode', 'none')
@@ -191,7 +193,10 @@ class FederatedServer:
             )
         else:  # Encrypted modes
             self.logger.info("Aggregating encrypted updates.")
-            self.aggregator.aggregate_encrypted_updates(self.client_updates_this_round)
+            self.aggregator.aggregate_encrypted_updates(
+                self.client_updates_this_round,
+                ckks_public_context_bytes=self.ckks_public_context_bytes
+            )
 
         if self.config.get('weighted_aggregation', True):
             self.aggregator.aggregate_train_loss_weighted(train_losses, train_sizes, self.current_round)
@@ -239,6 +244,10 @@ class FederatedServer:
     def _on_client_ready(self, data: Dict):
         self.logger.info("Client %s is ready and sent data stats.", request.sid)
         self.registered_clients.add(request.sid)
+
+        if 'ckks_public_context' in data and self.ckks_public_context_bytes is None:
+            self.ckks_public_context_bytes = codecs.decode(data['ckks_public_context'].encode(), 'base64')
+            self.logger.info("Received CKKS public context from client.")
 
         samples_per_class = pickle_string_to_object(data['samples_per_class'])
         self.client_stats_buffer.append(samples_per_class)

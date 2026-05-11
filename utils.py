@@ -172,3 +172,81 @@ def multiply_encrypted_weights_by_scalar(
         mul_values = [w * scalar for w in weights[i]['values']]
         multiplied_weights.append({'shape': weights[i]['shape'], 'values': mul_values})
     return multiplied_weights
+
+
+# --- CKKS (TenSEAL) functions ---
+
+def encrypt_weights_ckks(
+        context: Any,
+        weights: List[np.ndarray],
+        logger: logging.Logger = log
+) -> List[Dict[str, Any]]:
+    """
+    Encrypts model weights using TenSEAL CKKS batched vectors.
+    Each layer is split into chunks of at most poly_modulus_degree//2 values.
+    """
+    import tenseal as ts
+    max_slots = context.poly_modulus_degree() // 2
+    encrypted = []
+    num_layers = len(weights)
+    logger.info("Starting CKKS encryption of %d layers (max_slots=%d)...", num_layers, max_slots)
+    for i, layer in enumerate(weights):
+        flat = layer.flatten().tolist()
+        chunks = [flat[j:j + max_slots] for j in range(0, len(flat), max_slots)]
+        enc_chunks = [ts.ckks_vector(context, chunk).serialize() for chunk in chunks]
+        encrypted.append({'shape': layer.shape, 'chunks': enc_chunks, 'size': len(flat)})
+        logger.info("CKKS encryption: layer %d/%d done", i + 1, num_layers)
+    logger.info("CKKS encryption complete.")
+    return encrypted
+
+
+def decrypt_weights_ckks(
+        context: Any,
+        encrypted_weights: List[Dict[str, Any]],
+        logger: logging.Logger = log
+) -> List[np.ndarray]:
+    """Decrypts a list of CKKS-encrypted weight layers."""
+    import tenseal as ts
+    decrypted = []
+    num_layers = len(encrypted_weights)
+    logger.info("Starting CKKS decryption of %d layers...", num_layers)
+    for i, item in enumerate(encrypted_weights):
+        flat = []
+        for chunk_bytes in item['chunks']:
+            flat.extend(ts.ckks_vector_from(context, chunk_bytes).decrypt())
+        decrypted.append(np.array(flat[:item['size']], dtype=np.float32).reshape(item['shape']))
+        logger.info("CKKS decryption: layer %d/%d done", i + 1, num_layers)
+    logger.info("CKKS decryption complete.")
+    return decrypted
+
+
+def sum_encrypted_weights_ckks(
+        context: Any,
+        weights_a: List[Dict[str, Any]],
+        weights_b: List[Dict[str, Any]]
+) -> List[Dict[str, Any]]:
+    """Homomorphically adds two lists of CKKS-encrypted weights."""
+    import tenseal as ts
+    result = []
+    for a, b in zip(weights_a, weights_b):
+        chunks = []
+        for ca, cb in zip(a['chunks'], b['chunks']):
+            va = ts.ckks_vector_from(context, ca)
+            vb = ts.ckks_vector_from(context, cb)
+            chunks.append((va + vb).serialize())
+        result.append({'shape': a['shape'], 'chunks': chunks, 'size': a['size']})
+    return result
+
+
+def multiply_encrypted_weights_ckks_by_scalar(
+        context: Any,
+        weights: List[Dict[str, Any]],
+        scalar: Union[int, float]
+) -> List[Dict[str, Any]]:
+    """Homomorphically multiplies CKKS-encrypted weights by a plaintext scalar."""
+    import tenseal as ts
+    result = []
+    for item in weights:
+        chunks = [(ts.ckks_vector_from(context, c) * scalar).serialize() for c in item['chunks']]
+        result.append({'shape': item['shape'], 'chunks': chunks, 'size': item['size']})
+    return result

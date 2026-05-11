@@ -133,7 +133,11 @@ def start_server_thread(config: Dict, server_instance_ref: List) -> None:
 def start_ta_thread(config: Dict, ta_instance_ref: List) -> None:
     worker_id = config.get('worker_id', 'N/A')
     try:
-        ta = TrustedAuthority(host=config['ip_address'], port=config['ta_port'])
+        ta = TrustedAuthority(
+            host=config['ip_address'],
+            port=config['ta_port'],
+            he_backend=config.get('he_backend', 'paillier')
+        )
         ta_instance_ref.append(ta)
         ta.run()
     except Exception as e:
@@ -216,6 +220,15 @@ def run_grid_search_worker(
             use_encryption = config.get('encryption_mode', 'no_encryption') != 'no_encryption'
             ta_thread = None
             if use_encryption:
+                if not wait_for_port_free(config['ip_address'], config['ta_port'], timeout=180):
+                    msg = f"[W{worker_id}] TA port {config['ta_port']} still occupied after 180s. Skipping {dataset_name}|{model_name}."
+                    print(msg)
+                    if telegram_token and telegram_chat_id:
+                        send_telegram(telegram_token, telegram_chat_id,
+                                      f"<b>⚠️ FCGS TA Port busy — Worker {worker_id} ({pc_name})</b>\n"
+                                      f"Config: {dataset_name} | {model_name}\n"
+                                      f"Porta TA {config['ta_port']} occupata dopo 180s. Skipping.")
+                    continue
                 ta_thread = threading.Thread(target=start_ta_thread, args=(config, ta_instance_ref))
                 ta_thread.start()
                 time.sleep(3)
@@ -369,6 +382,7 @@ def main():
                 # Normalizza la riga del CSV nello stesso modo in cui normalizzeremo le nuove config
                 model_name_from_row = row.get('model_name') or ''
                 if row.get('aggregation_algorithm') != "FedProx": row['fedprox_mu'] = '0.0'
+                if row.get('encryption_mode') == 'no_encryption': row['he_backend'] = 'N/A'
                 if 'ResNet' in model_name_from_row or 'GoogLeNet' in model_name_from_row or 'AlexNet' in model_name_from_row:
                     row.setdefault('image_size', '224')
                     row.setdefault('convnet_hidden1', '-1')
@@ -401,6 +415,7 @@ def main():
                                                   f"\n[{total_generated_configs}] Generated Raw Config:\n{json.dumps(hyper_config, indent=2)}")
 
                 if hyper_config.get('aggregation_algorithm') != "FedProx": hyper_config['fedprox_mu'] = 0.0
+                if hyper_config.get('encryption_mode') == 'no_encryption': hyper_config['he_backend'] = 'N/A'
                 if 'ResNet' in model_name or 'GoogLeNet' in model_name or 'AlexNet' in model_name:
                     hyper_config['image_size'] = 224
                     hyper_config.setdefault('convnet_hidden1', -1)

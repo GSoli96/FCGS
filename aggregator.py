@@ -8,7 +8,8 @@ import logging
 
 # --- MODIFICA CHIAVE: Import corretto ---
 from model_manager import ModelManager
-from utils import sum_encrypted_weights, multiply_encrypted_weights_by_scalar
+from utils import (sum_encrypted_weights, multiply_encrypted_weights_by_scalar,
+                   sum_encrypted_weights_ckks, multiply_encrypted_weights_ckks_by_scalar)
 
 
 class Aggregator:
@@ -74,17 +75,28 @@ class Aggregator:
         else:
             raise ValueError(f"Aggregation algorithm '{algorithm}' is not supported.")
 
-    def aggregate_encrypted_updates(self, round_client_updates):
+    def aggregate_encrypted_updates(self, round_client_updates, ckks_public_context_bytes=None):
         client_sizes = [update['train_size'] for update in round_client_updates]
-        summed_encrypted_weights = multiply_encrypted_weights_by_scalar(
-            round_client_updates[0]['weights'], client_sizes[0]
-        )
-        for i in range(1, len(round_client_updates)):
-            weighted_update = multiply_encrypted_weights_by_scalar(
-                round_client_updates[i]['weights'], client_sizes[i]
-            )
-            summed_encrypted_weights = sum_encrypted_weights(summed_encrypted_weights, weighted_update)
-        self.current_weights = summed_encrypted_weights
+        first_weights = round_client_updates[0]['weights']
+
+        if first_weights and isinstance(first_weights[0], dict) and 'chunks' in first_weights[0]:
+            # CKKS backend
+            import tenseal as ts
+            context = ts.context_from(ckks_public_context_bytes)
+            summed = multiply_encrypted_weights_ckks_by_scalar(context, first_weights, client_sizes[0])
+            for i in range(1, len(round_client_updates)):
+                weighted = multiply_encrypted_weights_ckks_by_scalar(
+                    context, round_client_updates[i]['weights'], client_sizes[i])
+                summed = sum_encrypted_weights_ckks(context, summed, weighted)
+        else:
+            # Paillier backend
+            summed = multiply_encrypted_weights_by_scalar(first_weights, client_sizes[0])
+            for i in range(1, len(round_client_updates)):
+                weighted = multiply_encrypted_weights_by_scalar(
+                    round_client_updates[i]['weights'], client_sizes[i])
+                summed = sum_encrypted_weights(summed, weighted)
+
+        self.current_weights = summed
         self.logger.info("Encrypted aggregation (weighted sum) complete.")
 
     def aggregate_train_loss_weighted(self, client_losses: List[float], client_sizes: List[int],

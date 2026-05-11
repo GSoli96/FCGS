@@ -1,5 +1,10 @@
+import codecs
+import ctypes
 import logging
 import pickle
+import threading
+import time
+from threading import Thread
 from flask import Flask, request
 from flask_socketio import SocketIO, emit
 from phe import paillier
@@ -14,18 +19,34 @@ class TrustedAuthority:
     alongside a federated learning server to manage key distribution securely.
     """
 
-    def __init__(self, host: str, port: int, key_length: int = 128):
+    def __init__(self, host: str, port: int, key_length: int = 128, he_backend: str = 'paillier'):
         self.host = host
         self.port = port
+        self.he_backend = he_backend
         self.app = Flask(__name__)
         self.socketio = SocketIO(self.app)
         self.logger = self._setup_logger()
 
-        self.logger.info("Generating Paillier keypair with n_length=%d...", key_length)
-        self.pubkey, self.privkey = paillier.generate_paillier_keypair(n_length=key_length)
-        self.pickled_pubkey = object_to_pickle_string(self.pubkey)
-        self.pickled_privkey = object_to_pickle_string(self.privkey)
-        self.logger.info("Keypair generated successfully.")
+        if he_backend == 'ckks':
+            self.logger.info("Generating TenSEAL CKKS context (poly_modulus_degree=8192)...")
+            import tenseal as ts
+            context = ts.context(
+                ts.SCHEME_TYPE.CKKS,
+                poly_modulus_degree=8192,
+                coeff_mod_bit_sizes=[60, 40, 40, 60]
+            )
+            context.generate_galois_keys()
+            context.global_scale = 2 ** 40
+            self.ckks_full_context_bytes = context.serialize(save_secret_key=True)
+            context.make_context_public()
+            self.ckks_public_context_bytes = context.serialize(save_secret_key=False)
+            self.logger.info("CKKS context generated successfully.")
+        else:
+            self.logger.info("Generating Paillier keypair with n_length=%d...", key_length)
+            self.pubkey, self.privkey = paillier.generate_paillier_keypair(n_length=key_length)
+            self.pickled_pubkey = object_to_pickle_string(self.pubkey)
+            self.pickled_privkey = object_to_pickle_string(self.privkey)
+            self.logger.info("Keypair generated successfully.")
 
         self._register_handlers()
 
@@ -51,6 +72,7 @@ class TrustedAuthority:
     def run(self) -> None:
         """Starts the Flask-SocketIO server for the TA."""
         self.logger.info("Trusted Authority starting on http://%s:%d", self.host, self.port)
+        self._run_thread_ident = threading.current_thread().ident
         self.socketio.run(self.app, host=self.host, port=self.port)
 
     def _on_connect(self):
@@ -61,18 +83,32 @@ class TrustedAuthority:
 
     def _on_shutdown_ta(self):
         """Handles a shutdown request from the orchestrator."""
-        print("Shutdown request received. Stopping the Trusted Authority server.")
-        # self.socketio.stop()
-        print("Trusted Authority server stopped successfully.")
-        exit(0)
+        self.logger.info("Shutdown request received. Stopping the Trusted Authority server.")
+        thread_ident = getattr(self, '_run_thread_ident', None)
+        def _do_stop():
+            time.sleep(0.5)
+            if thread_ident:
+                ctypes.pythonapi.PyThreadState_SetAsyncExc(
+                    ctypes.c_ulong(thread_ident),
+                    ctypes.py_object(SystemExit)
+                )
+        Thread(target=_do_stop, daemon=True).start()
 
     def _on_request_keys(self):
         """Handles a client's request for keys and sends them back."""
         self.logger.info("Received key request from client %s. Distributing keys.", request.sid)
-        emit('distribute_keys', {
-            'pubkey': self.pickled_pubkey,
-            'privkey': self.pickled_privkey
-        })
+        if self.he_backend == 'ckks':
+            emit('distribute_keys', {
+                'backend': 'ckks',
+                'full_context': codecs.encode(self.ckks_full_context_bytes, 'base64').decode(),
+                'public_context': codecs.encode(self.ckks_public_context_bytes, 'base64').decode(),
+            })
+        else:
+            emit('distribute_keys', {
+                'backend': 'paillier',
+                'pubkey': self.pickled_pubkey,
+                'privkey': self.pickled_privkey,
+            })
 
 if __name__ == '__main__':
     # Esempio di come avviare la TA stand-alone per test
