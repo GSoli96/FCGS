@@ -186,7 +186,8 @@ def encrypt_weights_ckks(
     Each layer is split into chunks of at most poly_modulus_degree//2 values.
     """
     import tenseal as ts
-    max_slots = context.poly_modulus_degree() // 2
+    # poly_modulus_degree=8192 → 4096 slot per vettore (TenSEAL non espone il valore dal context)
+    max_slots = 4096
     encrypted = []
     num_layers = len(weights)
     logger.info("Starting CKKS encryption of %d layers (max_slots=%d)...", num_layers, max_slots)
