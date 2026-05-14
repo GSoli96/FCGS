@@ -244,6 +244,7 @@ class ModelManager:
               mu: float = 0.0) -> Tuple[float, Dict, float, int]:
         trainable_params = self._get_trainable_parameters()
         optimizer = torch.optim.Adam(trainable_params, lr=lr)
+        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', patience=3, factor=0.1)
         train_loader = self._get_dataloader('train', batch_size)
 
         global_params_tensor = None
@@ -254,6 +255,7 @@ class ModelManager:
         for epoch in range(epochs):
             epoch_loss = self._run_training_epoch(train_loader, optimizer, algorithm, global_params_tensor, mu)
             final_train_loss = epoch_loss
+            scheduler.step(epoch_loss)
 
         _, metric_score, _, dataset_size = self.validate(batch_size, split='train')
         return 0.0, metric_score, final_train_loss, dataset_size

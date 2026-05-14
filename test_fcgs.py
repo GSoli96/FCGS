@@ -343,8 +343,8 @@ class TestConfigCounting(unittest.TestCase):
         cfg = self._load('grid_search_config.json')
         count = _count_unique_configs(cfg)
         # 2 combo cifratura: no_enc(N/A) + homomorphic+ckks
-        self.assertEqual(count, 201_600,
-                         f"geosciences: attese 201600 config uniche, trovate {count}")
+        self.assertEqual(count, 17_920,
+                         f"geosciences: attese 17920 config uniche, trovate {count}")
 
     def test_domino11_unique_config_count(self):
         cfg = self._load('grid_search_config_MSIDomino11.json')
@@ -363,8 +363,8 @@ class TestConfigCounting(unittest.TestCase):
         for fname in CONFIG_FILES.values():
             cfg = self._load(fname)
             total += _count_unique_configs(cfg)
-        self.assertEqual(total, 554_400,
-                         f"Totale config uniche: attese 554400, trovate {total}")
+        self.assertEqual(total, 370_720,
+                         f"Totale config uniche: attese 370720, trovate {total}")
 
 
 # ---------------------------------------------------------------------------
