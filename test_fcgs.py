@@ -66,6 +66,8 @@ def _normalize_config(hyper_config: Dict, model_name: str) -> Dict:
     c = hyper_config.copy()
     if c.get('aggregation_algorithm') != 'FedProx':
         c['fedprox_mu'] = 0.0
+    if c.get('encryption_mode') == 'no_encryption':
+        c['he_backend'] = 'N/A'
     if 'ResNet' in model_name or 'GoogLeNet' in model_name or 'AlexNet' in model_name:
         c['image_size'] = 224
         c.setdefault('convnet_hidden1', -1)
@@ -280,10 +282,17 @@ class TestFingerprintNormalization(unittest.TestCase):
         norm = _normalize_config(c, 'ConvNet')
         self.assertEqual(norm['fedprox_mu'], 0.05)
 
-    def test_he_backend_not_normalized(self):
-        """he_backend NON viene normalizzato: ckks rimane ckks (schema distinto)."""
+    def test_he_backend_normalized_to_na_for_no_encryption(self):
+        """Con no_encryption he_backend viene normalizzato a N/A (schema irrilevante)."""
         c = {'aggregation_algorithm': 'FedAvg', 'fedprox_mu': 0.05,
              'encryption_mode': 'no_encryption', 'he_backend': 'ckks', 'model_name': 'ConvNet'}
+        norm = _normalize_config(c, 'ConvNet')
+        self.assertEqual(norm['he_backend'], 'N/A')
+
+    def test_he_backend_kept_for_homomorphic(self):
+        """Con cifratura omomorfica he_backend rimane ckks (schema usato a runtime)."""
+        c = {'aggregation_algorithm': 'FedAvg', 'fedprox_mu': 0.05,
+             'encryption_mode': 'homomorphic', 'he_backend': 'ckks', 'model_name': 'ConvNet'}
         norm = _normalize_config(c, 'ConvNet')
         self.assertEqual(norm['he_backend'], 'ckks')
 
@@ -301,15 +310,14 @@ class TestFingerprintNormalization(unittest.TestCase):
         norm = _normalize_config(c, 'ConvNet')
         self.assertEqual(norm['image_size'], 128)
 
-    def test_only_ckks_in_search_space(self):
-        """Tutti i config devono avere solo ckks in he_backend (bfv non incluso)."""
+    def test_he_backend_is_ckks_only(self):
+        """Per ora he_backend usa solo ckks."""
         for machine, fname in CONFIG_FILES.items():
             with self.subTest(machine=machine):
                 with open(os.path.join(PROJECT_ROOT, fname)) as f:
                     cfg = json.load(f)
                 backends = cfg['common_search_space']['he_backend']
-                self.assertEqual(backends, ['ckks'],
-                                 f"{fname}: he_backend deve essere ['ckks'], trovato {backends}")
+                self.assertEqual(backends, ['ckks'], f"he_backend deve essere ['ckks'] in {fname}")
 
     def test_image_size_128_224_deduplicates_for_resnet(self):
         base = {'dataset_name': 'ds', 'model_name': 'ResNet18',
@@ -334,28 +342,29 @@ class TestConfigCounting(unittest.TestCase):
     def test_geosciences_unique_config_count(self):
         cfg = self._load('grid_search_config.json')
         count = _count_unique_configs(cfg)
-        self.assertEqual(count, 100_800,
-                         f"geosciences: attese 100800 config uniche, trovate {count}")
+        # 2 combo cifratura: no_enc(N/A) + homomorphic+ckks
+        self.assertEqual(count, 201_600,
+                         f"geosciences: attese 201600 config uniche, trovate {count}")
 
     def test_domino11_unique_config_count(self):
         cfg = self._load('grid_search_config_MSIDomino11.json')
         count = _count_unique_configs(cfg)
-        self.assertEqual(count, 113_400,
-                         f"MSIDomino11: attese 113400 config uniche, trovate {count}")
+        self.assertEqual(count, 226_800,
+                         f"MSIDomino11: attese 226800 config uniche, trovate {count}")
 
     def test_domino12_unique_config_count(self):
         cfg = self._load('grid_search_config_MSIDomino12.json')
         count = _count_unique_configs(cfg)
-        self.assertEqual(count, 63_000,
-                         f"MSIDomino12: attese 63000 config uniche, trovate {count}")
+        self.assertEqual(count, 126_000,
+                         f"MSIDomino12: attese 126000 config uniche, trovate {count}")
 
     def test_total_config_count(self):
         total = 0
         for fname in CONFIG_FILES.values():
             cfg = self._load(fname)
             total += _count_unique_configs(cfg)
-        self.assertEqual(total, 277_200,
-                         f"Totale config uniche: attese 277200, trovate {total}")
+        self.assertEqual(total, 554_400,
+                         f"Totale config uniche: attese 554400, trovate {total}")
 
 
 # ---------------------------------------------------------------------------
@@ -824,13 +833,13 @@ class TestGridSearchConfigLoading(unittest.TestCase):
             models = set(cfg['model_specific_search_space'].keys())
             self.assertEqual(models, expected_models, f"Modelli mancanti/extra in {fname}: {models ^ expected_models}")
 
-    def test_encryption_mode_is_no_encryption(self):
+    def test_encryption_modes_present(self):
         for fname in CONFIG_FILES.values():
             with open(os.path.join(PROJECT_ROOT, fname)) as f:
                 cfg = json.load(f)
-            modes = cfg['common_search_space']['encryption_mode']
-            self.assertEqual(modes, ['no_encryption'],
-                             f"encryption_mode deve essere ['no_encryption'] in {fname}")
+            modes = set(cfg['common_search_space']['encryption_mode'])
+            self.assertIn('no_encryption', modes, f"no_encryption mancante in {fname}")
+            self.assertIn('homomorphic', modes, f"homomorphic mancante in {fname}")
 
     def test_aggregation_algorithms_are_fedavg_fedprox(self):
         for fname in CONFIG_FILES.values():

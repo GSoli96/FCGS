@@ -62,7 +62,8 @@
   ],
   "common_search_space": {
     "encryption_mode": [
-      "no_encryption"
+      "no_encryption",
+      "homomorphic"
     ],
     "he_backend": [
       "ckks"
