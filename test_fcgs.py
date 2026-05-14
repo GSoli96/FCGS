@@ -349,22 +349,22 @@ class TestConfigCounting(unittest.TestCase):
     def test_domino11_unique_config_count(self):
         cfg = self._load('grid_search_config_MSIDomino11.json')
         count = _count_unique_configs(cfg)
-        self.assertEqual(count, 226_800,
-                         f"MSIDomino11: attese 226800 config uniche, trovate {count}")
+        self.assertEqual(count, 20_160,
+                         f"MSIDomino11: attese 20160 config uniche, trovate {count}")
 
     def test_domino12_unique_config_count(self):
         cfg = self._load('grid_search_config_MSIDomino12.json')
         count = _count_unique_configs(cfg)
-        self.assertEqual(count, 126_000,
-                         f"MSIDomino12: attese 126000 config uniche, trovate {count}")
+        self.assertEqual(count, 11_200,
+                         f"MSIDomino12: attese 11200 config uniche, trovate {count}")
 
     def test_total_config_count(self):
         total = 0
         for fname in CONFIG_FILES.values():
             cfg = self._load(fname)
             total += _count_unique_configs(cfg)
-        self.assertEqual(total, 370_720,
-                         f"Totale config uniche: attese 370720, trovate {total}")
+        self.assertEqual(total, 49_280,
+                         f"Totale config uniche: attese 49280, trovate {total}")
 
 
 # ---------------------------------------------------------------------------
