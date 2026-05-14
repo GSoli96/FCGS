@@ -65,8 +65,7 @@
       "no_encryption"
     ],
     "he_backend": [
-      "ckks",
-      "bfv"
+      "ckks"
     ],
     "device": [
       "cuda"

@@ -369,7 +369,6 @@ def main():
                 # Normalizza la riga del CSV nello stesso modo in cui normalizzeremo le nuove config
                 model_name_from_row = row.get('model_name') or ''
                 if row.get('aggregation_algorithm') != "FedProx": row['fedprox_mu'] = '0.0'
-                if row.get('encryption_mode') == 'no_encryption': row['he_backend'] = 'N/A'
                 if 'ResNet' in model_name_from_row or 'GoogLeNet' in model_name_from_row or 'AlexNet' in model_name_from_row:
                     row.setdefault('image_size', '224')
                     row.setdefault('convnet_hidden1', '-1')
@@ -402,7 +401,6 @@ def main():
                                                   f"\n[{total_generated_configs}] Generated Raw Config:\n{json.dumps(hyper_config, indent=2)}")
 
                 if hyper_config.get('aggregation_algorithm') != "FedProx": hyper_config['fedprox_mu'] = 0.0
-                if hyper_config.get('encryption_mode') == 'no_encryption': hyper_config['he_backend'] = 'N/A'
                 if 'ResNet' in model_name or 'GoogLeNet' in model_name or 'AlexNet' in model_name:
                     hyper_config['image_size'] = 224
                     hyper_config.setdefault('convnet_hidden1', -1)

@@ -66,8 +66,6 @@ def _normalize_config(hyper_config: Dict, model_name: str) -> Dict:
     c = hyper_config.copy()
     if c.get('aggregation_algorithm') != 'FedProx':
         c['fedprox_mu'] = 0.0
-    if c.get('encryption_mode') == 'no_encryption':
-        c['he_backend'] = 'N/A'
     if 'ResNet' in model_name or 'GoogLeNet' in model_name or 'AlexNet' in model_name:
         c['image_size'] = 224
         c.setdefault('convnet_hidden1', -1)
@@ -282,13 +280,12 @@ class TestFingerprintNormalization(unittest.TestCase):
         norm = _normalize_config(c, 'ConvNet')
         self.assertEqual(norm['fedprox_mu'], 0.05)
 
-    def test_no_encryption_normalizes_he_backend(self):
-        for backend in ('ckks', 'bfv', 'paillier'):
-            with self.subTest(backend=backend):
-                c = {'aggregation_algorithm': 'FedAvg', 'fedprox_mu': 0.05,
-                     'encryption_mode': 'no_encryption', 'he_backend': backend, 'model_name': 'ConvNet'}
-                norm = _normalize_config(c, 'ConvNet')
-                self.assertEqual(norm['he_backend'], 'N/A')
+    def test_he_backend_not_normalized(self):
+        """he_backend NON viene normalizzato: ckks rimane ckks (schema distinto)."""
+        c = {'aggregation_algorithm': 'FedAvg', 'fedprox_mu': 0.05,
+             'encryption_mode': 'no_encryption', 'he_backend': 'ckks', 'model_name': 'ConvNet'}
+        norm = _normalize_config(c, 'ConvNet')
+        self.assertEqual(norm['he_backend'], 'ckks')
 
     def test_googlenet_forces_image_size_224(self):
         for model in ('GoogLeNet', 'AlexNet', 'ResNet18', 'ResNet34', 'ResNet50', 'ResNet101'):
@@ -304,17 +301,15 @@ class TestFingerprintNormalization(unittest.TestCase):
         norm = _normalize_config(c, 'ConvNet')
         self.assertEqual(norm['image_size'], 128)
 
-    def test_different_he_backends_produce_same_fingerprint_with_no_encryption(self):
-        base = {'dataset_name': 'ds', 'model_name': 'ConvNet', 'image_size': 128,
-                'aggregation_algorithm': 'FedAvg', 'fedprox_mu': 0.05,
-                'encryption_mode': 'no_encryption', 'global_epoch': 5}
-        c_ckks = {**base, 'he_backend': 'ckks'}
-        c_bfv  = {**base, 'he_backend': 'bfv'}
-        norm_ckks = _normalize_config(c_ckks, 'ConvNet')
-        norm_bfv  = _normalize_config(c_bfv,  'ConvNet')
-        fp_ckks = _get_config_fingerprint(norm_ckks, self.all_keys)
-        fp_bfv  = _get_config_fingerprint(norm_bfv,  self.all_keys)
-        self.assertEqual(fp_ckks, fp_bfv, "CKKS e BFV con no_encryption devono dare stesso fingerprint")
+    def test_only_ckks_in_search_space(self):
+        """Tutti i config devono avere solo ckks in he_backend (bfv non incluso)."""
+        for machine, fname in CONFIG_FILES.items():
+            with self.subTest(machine=machine):
+                with open(os.path.join(PROJECT_ROOT, fname)) as f:
+                    cfg = json.load(f)
+                backends = cfg['common_search_space']['he_backend']
+                self.assertEqual(backends, ['ckks'],
+                                 f"{fname}: he_backend deve essere ['ckks'], trovato {backends}")
 
     def test_image_size_128_224_deduplicates_for_resnet(self):
         base = {'dataset_name': 'ds', 'model_name': 'ResNet18',
