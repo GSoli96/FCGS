@@ -52,6 +52,14 @@ class FederatedServer:
         self.total_training_size_in_round: int = 0
         self.expected_eval_count: int = 0
 
+        # --- Dropout & Watchdog tracking ---
+        self.clients_selected_for_round: Set[str] = set()
+        self.clients_submitted_update: Set[str] = set()
+        self.clients_submitted_eval: Set[str] = set()
+        self.round_phase: str = 'idle'  # 'idle' | 'update' | 'eval'
+        self._last_activity: float = time.time()
+        self._round_timeout: int = int(config.get('round_timeout', 150))
+
         self.aggregator = Aggregator(self.config, self.logger)
 
         self.client_stats_buffer: List[Dict] = []
@@ -102,7 +110,21 @@ class FederatedServer:
         """Starts the Flask-SocketIO server."""
         self.logger.info("Federated Server starting...")
         self._run_thread_ident = threading.current_thread().ident
+        Thread(target=self._watchdog_loop, daemon=True).start()
         self.socketio.run(self.app, host=self.config['ip_address'], port=self.config['port'])
+
+    def _watchdog_loop(self) -> None:
+        while not self.is_training_finished:
+            time.sleep(30)
+            if self.is_training_finished:
+                break
+            if self.round_phase != 'idle' and time.time() - self._last_activity > self._round_timeout:
+                self.logger.error(
+                    "Watchdog: no activity for %ds in round %d (%s phase). Forcing shutdown.",
+                    self._round_timeout, self.current_round, self.round_phase
+                )
+                self._shutdown_server()
+                break
 
     def _register_routes_and_handlers(self) -> None:
         """Registers Flask routes and SocketIO event handlers."""
@@ -131,6 +153,48 @@ class FederatedServer:
         ]
         return render_template('stats.html', tables=[stats_df.to_html(classes='data')], texts=info_texts, images=images)
 
+    def _maybe_aggregate_updates(self) -> None:
+        """Called under self.lock. Aggregates if all expected updates have arrived."""
+        if self.num_clients_per_round <= 0:
+            self.logger.error("No clients remaining in round %d. Forcing shutdown.", self.current_round)
+            self._shutdown_server()
+            return
+        if len(self.client_updates_this_round) >= self.num_clients_per_round:
+            self.logger.info("All %d client updates for round %d received. Aggregating...",
+                             self.num_clients_per_round, self.current_round)
+            self._aggregate_updates()
+            if self.current_round >= self.config['global_epoch'] - 1:
+                self.logger.info("Maximum number of global rounds reached. Finishing process.")
+                self.is_training_finished = True
+            self._trigger_global_evaluation()
+
+    def _maybe_finalize_eval(self) -> None:
+        """Called under self.lock. Finalizes eval if all expected evaluations have arrived."""
+        if self.expected_eval_count <= 0:
+            self.logger.error("No clients remaining for eval in round %d. Forcing shutdown.", self.current_round)
+            self._shutdown_server()
+            return
+        if len(self.client_evaluations_this_round) >= self.expected_eval_count:
+            self.logger.info("All evaluations received for round %d. Aggregating evaluation metrics.",
+                             self.current_round)
+            is_early_stopping = self.aggregator.aggregate_evaluation_results(
+                self.client_evaluations_this_round, self.current_round
+            )
+            if is_early_stopping:
+                self.logger.info("Early stopping condition met. Finishing process.")
+                self.is_training_finished = True
+            if self.is_training_finished:
+                self.logger.info("Federated training is complete.")
+                self.aggregator.log_best_model_stats()
+                self.aggregator.save_results()
+                for sid in self.registered_clients:
+                    emit("shutdown", room=sid)
+                self.round_phase = 'idle'
+                self._shutdown_server()
+            else:
+                self.logger.info("Proceeding to the next round.")
+                self._start_next_training_round()
+
     def _start_next_training_round(self) -> None:
         """Initiates the next round of federated training."""
         self.current_round += 1
@@ -139,14 +203,19 @@ class FederatedServer:
         # Clear buffers for the new round
         self.client_updates_this_round.clear()
         self.client_metrics_buffer.clear()
+        self.clients_submitted_update.clear()
 
         all_available_clients = list(self.registered_clients)
         k = min(self.min_num_workers, len(all_available_clients))
         if k == 0:
             self.logger.error("No clients available to start a round. Aborting.")
+            self._shutdown_server()
             return
         selected_clients = random.sample(all_available_clients, k)
 
+        self.clients_selected_for_round = set(selected_clients)
+        self.round_phase = 'update'
+        self._last_activity = time.time()
         self.num_clients_per_round = len(selected_clients)
 
         current_weights_pickled = object_to_pickle_string(self.aggregator.current_weights)
@@ -167,7 +236,10 @@ class FederatedServer:
         """Sends the aggregated model to all clients for evaluation."""
         self.logger.info("Triggering global model evaluation on all %d clients.", len(self.registered_clients))
         self.client_evaluations_this_round.clear()
+        self.clients_submitted_eval.clear()
         self.expected_eval_count = len(self.registered_clients)
+        self.round_phase = 'eval'
+        self._last_activity = time.time()
 
         data_to_send = {
             'batch_size': self.config['batch_size'],
@@ -225,10 +297,29 @@ class FederatedServer:
         self.logger.info("Client connected: %s", request.sid)
 
     def _on_disconnect(self):
-        self.logger.info("Client disconnected: %s", request.sid)
-        if request.sid in self.registered_clients:
-            self.registered_clients.remove(request.sid)
-        # In a real system, you might need to handle client dropouts during a round.
+        with self.lock:
+            self.logger.info("Client disconnected: %s", request.sid)
+            if request.sid in self.registered_clients:
+                self.registered_clients.remove(request.sid)
+            if self.is_training_finished or self.current_round < 0:
+                return
+            if (self.round_phase == 'update'
+                    and request.sid in self.clients_selected_for_round
+                    and request.sid not in self.clients_submitted_update):
+                self.num_clients_per_round = max(0, self.num_clients_per_round - 1)
+                self.logger.warning(
+                    "Client %s dropped during update phase. Expected updates now: %d.",
+                    request.sid, self.num_clients_per_round
+                )
+                self._maybe_aggregate_updates()
+            elif (self.round_phase == 'eval'
+                    and request.sid not in self.clients_submitted_eval):
+                self.expected_eval_count = max(0, self.expected_eval_count - 1)
+                self.logger.warning(
+                    "Client %s dropped during eval phase. Expected evals now: %d.",
+                    request.sid, self.expected_eval_count
+                )
+                self._maybe_finalize_eval()
 
     def _on_reconnect(self):
         self.logger.info("Client reconnected: %s", request.sid)
@@ -297,44 +388,15 @@ class FederatedServer:
                 self.logger.error("Error unpickling weights from client %s: %s", request.sid, e)
                 return
 
+            self.clients_submitted_update.add(request.sid)
+            self._last_activity = time.time()
             self.client_updates_this_round.append(data)
-
-            if len(self.client_updates_this_round) >= self.num_clients_per_round:
-                self.logger.info("All %d client updates for round %d received. Aggregating...",
-                                 self.num_clients_per_round, self.current_round)
-                self._aggregate_updates()
-
-                if self.current_round >= self.config['global_epoch'] - 1:
-                    self.logger.info("Maximum number of global rounds reached. Finishing process.")
-                    self.is_training_finished = True
-
-                self._trigger_global_evaluation()
+            self._maybe_aggregate_updates()
 
     def _on_client_eval(self, data: Dict):
         with self.lock:
             self.logger.info("Received evaluation from client %s.", request.sid)
+            self.clients_submitted_eval.add(request.sid)
+            self._last_activity = time.time()
             self.client_evaluations_this_round.append(data)
-
-            if len(self.client_evaluations_this_round) >= self.expected_eval_count:
-                self.logger.info("All evaluations received for round %d. Aggregating evaluation metrics.",
-                                 self.current_round)
-
-                is_early_stopping = self.aggregator.aggregate_evaluation_results(
-                    self.client_evaluations_this_round, self.current_round
-                )
-
-                if is_early_stopping:
-                    self.logger.info("Early stopping condition met. Finishing process.")
-                    self.is_training_finished = True
-
-                if self.is_training_finished:
-                    self.logger.info("Federated training is complete.")
-                    self.aggregator.log_best_model_stats()
-                    self.aggregator.save_results()
-
-                    for sid in self.registered_clients:
-                        emit("shutdown", room=sid)
-                    self._shutdown_server()
-                else:
-                    self.logger.info("Proceeding to the next round.")
-                    self._start_next_training_round()
+            self._maybe_finalize_eval()

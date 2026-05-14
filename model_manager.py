@@ -49,6 +49,7 @@ class ModelManager:
         self.criterion = nn.CrossEntropyLoss()
         self.transform_pipeline = self._get_transforms()
         self.calibration_term = torch.zeros(self.num_classes, device=self.device)
+        self._datasets: Dict[str, ImageFolder] = {}  # cache dataset per split
 
     def _get_device(self, device_str: str) -> torch.device:
         if device_str == 'cuda' and torch.cuda.is_available():

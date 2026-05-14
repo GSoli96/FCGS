@@ -166,7 +166,7 @@ class FederatedClient:
             @ta_sio.on('distribute_keys')
             def on_receive_keys(key_data):
                 self.logger.info("Keys received from Trusted Authority (backend=%s).", key_data.get('backend', 'paillier'))
-                if key_data.get('backend') == 'ckks':
+                if key_data.get('backend') in ('ckks', 'bfv'):
                     import tenseal as ts
                     full_bytes = codecs.decode(key_data['full_context'].encode(), 'base64')
                     pub_bytes = codecs.decode(key_data['public_context'].encode(), 'base64')
@@ -205,7 +205,7 @@ class FederatedClient:
         samples_per_class = self.local_model.get_samples_per_class()
         self.logger.info("Stats calculated. Sending 'client_ready' to the main server.")
         ready_data = {'samples_per_class': object_to_pickle_string(samples_per_class)}
-        if self.encryption_mode != 'no_encryption' and self.he_backend == 'ckks':
+        if self.encryption_mode != 'no_encryption' and self.he_backend in ('ckks', 'bfv'):
             ready_data['ckks_public_context'] = codecs.encode(self.ckks_public_context_bytes, 'base64').decode()
         self.sio.emit('client_ready', ready_data)
 

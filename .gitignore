@@ -164,6 +164,7 @@ run_dataset*/
 csv_*/
 logs_*/
 static/plots/
+static/plots_*/
 fcgs_pid.txt
 *.log
 

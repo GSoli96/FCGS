@@ -4,6 +4,7 @@ import time
 import itertools
 import traceback
 import socket as _socket
+import shutil
 import requests
 from requests.exceptions import ConnectionError
 import socketio
@@ -296,6 +297,9 @@ def run_grid_search_worker(
                                   f"<b>⚠️ FCGS Server crash — Worker {worker_id} ({pc_name})</b>\n"
                                   f"Config: {dataset_name} | {model_name}\n"
                                   f"Server crashato prima di inizializzarsi.")
+            if os.path.exists(worker_splitting_dir):
+                shutil.rmtree(worker_splitting_dir)
+                print(f"[W{worker_id}] Cleaned up split dir: {worker_splitting_dir}")
             time.sleep(1)
 
             should_notify = False
@@ -443,7 +447,7 @@ def main():
     print(f"Adding {configs_to_run_count} new unique configurations to the execution queue.")
     print("=" * 80)
 
-    if task_queue.empty():
+    if configs_to_run_count == 0:
         print("=== No new configurations to run. Exiting. ===")
         return
 
