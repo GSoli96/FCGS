@@ -6,7 +6,7 @@
   "notification_interval": 100,
   "heartbeat_interval_hours": 4,
   "gpu_blacklist": [],
-  "num_parallel_executions": 12,
+  "num_parallel_executions": 3,
   "base_csv_path": "csv",
   "base_log_path": "logs",
   "base_plot_path": "static/plots",
@@ -15,44 +15,49 @@
   "weighted_aggregation": true,
   "datasets": [
     {
-      "name": "dataset_slices_sorted",
-      "path": "dataset/dataset_slices_sorted",
-      "num_classes": 2
+      "name": "dataset_multy_sorted",
+      "path": "dataset/dataset_multy_sorted",
+      "num_classes": 3
     },
     {
-      "name": "dataset_slices_sorted_augmented",
-      "path": "dataset/dataset_slices_sorted_augmented",
-      "num_classes": 2
+      "name": "dataset_multy_sorted_augmented",
+      "path": "dataset/dataset_multy_sorted_augmented",
+      "num_classes": 3
     },
     {
-      "name": "dataset_slices_sorted_T2",
-      "path": "dataset/dataset_slices_sorted_T2",
-      "num_classes": 2
+      "name": "dataset_multy_sorted_T2",
+      "path": "dataset/dataset_multy_sorted_T2",
+      "num_classes": 3
     },
     {
-      "name": "dataset_slices_sorted_T2_augmented",
-      "path": "dataset/dataset_slices_sorted_T2_augmented",
-      "num_classes": 2
+      "name": "dataset_multy_sorted_T2_augmented",
+      "path": "dataset/dataset_multy_sorted_T2_augmented",
+      "num_classes": 3
     },
     {
-      "name": "dataset_slices_sorted_T1",
-      "path": "dataset/dataset_slices_sorted_T1",
-      "num_classes": 2
+      "name": "dataset_multy_sorted_T1",
+      "path": "dataset/dataset_multy_sorted_T1",
+      "num_classes": 3
     },
     {
-      "name": "dataset_slices_sorted_T1_augmented",
-      "path": "dataset/dataset_slices_sorted_T1_augmented",
-      "num_classes": 2
+      "name": "dataset_multy_sorted_T1_augmented",
+      "path": "dataset/dataset_multy_sorted_T1_augmented",
+      "num_classes": 3
     },
     {
-      "name": "dataset_slices_sorted_Flair_augmented",
-      "path": "dataset/dataset_slices_sorted_Flair_augmented",
-      "num_classes": 2
+      "name": "dataset_multy_sorted_Flair_augmented",
+      "path": "dataset/dataset_multy_sorted_Flair_augmented",
+      "num_classes": 3
     },
     {
-      "name": "dataset_slices_sorted_Flair",
-      "path": "dataset/dataset_slices_sorted_Flair",
-      "num_classes": 2
+      "name": "dataset_multy_sorted_Flair",
+      "path": "dataset/dataset_multy_sorted_Flair",
+      "num_classes": 3
+    },
+    {
+      "name": "brain_tumor",
+      "path": "dbluigi/brain_tumor/train",
+      "num_classes": 4
     }
   ],
   "common_search_space": {

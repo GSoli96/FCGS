@@ -6,7 +6,7 @@
   "notification_interval": 100,
   "heartbeat_interval_hours": 4,
   "gpu_blacklist": [],
-  "num_parallel_executions": 12,
+  "num_parallel_executions": 3,
   "base_csv_path": "csv",
   "base_log_path": "logs",
   "base_plot_path": "static/plots",
@@ -15,44 +15,29 @@
   "weighted_aggregation": true,
   "datasets": [
     {
-      "name": "dataset_slices_sorted",
-      "path": "dataset/dataset_slices_sorted",
+      "name": "dataset_HAM1000",
+      "path": "dbluigi/dataset_HAM1000/dataset",
       "num_classes": 2
     },
     {
-      "name": "dataset_slices_sorted_augmented",
-      "path": "dataset/dataset_slices_sorted_augmented",
+      "name": "dataset_ISIC",
+      "path": "dbluigi/dataset_ISIC/dataset",
       "num_classes": 2
     },
     {
-      "name": "dataset_slices_sorted_T2",
-      "path": "dataset/dataset_slices_sorted_T2",
+      "name": "dataset_ISIC2",
+      "path": "dbluigi/dataset_ISIC2",
       "num_classes": 2
     },
     {
-      "name": "dataset_slices_sorted_T2_augmented",
-      "path": "dataset/dataset_slices_sorted_T2_augmented",
-      "num_classes": 2
+      "name": "dataset_RD_colored",
+      "path": "dbluigi/dataset_RD/colored_images",
+      "num_classes": 5
     },
     {
-      "name": "dataset_slices_sorted_T1",
-      "path": "dataset/dataset_slices_sorted_T1",
-      "num_classes": 2
-    },
-    {
-      "name": "dataset_slices_sorted_T1_augmented",
-      "path": "dataset/dataset_slices_sorted_T1_augmented",
-      "num_classes": 2
-    },
-    {
-      "name": "dataset_slices_sorted_Flair_augmented",
-      "path": "dataset/dataset_slices_sorted_Flair_augmented",
-      "num_classes": 2
-    },
-    {
-      "name": "dataset_slices_sorted_Flair",
-      "path": "dataset/dataset_slices_sorted_Flair",
-      "num_classes": 2
+      "name": "dataset_RD_kdr299",
+      "path": "dbluigi/dataset_RD/kdr299_iimp",
+      "num_classes": 5
     }
   ],
   "common_search_space": {
