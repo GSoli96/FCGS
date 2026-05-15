@@ -128,10 +128,14 @@ class DatasetSplitter:
             os.makedirs(destination_dir, exist_ok=True)
 
             source_image_path = os.path.join(self.source_images_dir, class_dir_name, filename)
-            destination_image_path = os.path.join(destination_dir, filename)
+            safe_filename = filename.replace(',', '_')
+            destination_image_path = os.path.join(destination_dir, safe_filename)
 
             if os.path.exists(source_image_path):
-                shutil.copy(source_image_path, destination_image_path)
+                try:
+                    shutil.copy(source_image_path, destination_image_path)
+                except Exception as e:
+                    print(f"Warning: Could not copy {source_image_path}: {e}")
             else:
                 print(f"Warning: Source image not found and will be skipped: {source_image_path}")
 

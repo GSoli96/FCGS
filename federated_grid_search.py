@@ -263,7 +263,8 @@ def run_grid_search_worker(
             server_thread = threading.Thread(target=start_server_thread, args=(config, server_instance_ref))
             server_thread.start()
             server_url = f"http://{config['ip_address']}:{config['port']}"
-            if wait_for_server_ready(server_url):
+            server_startup_timeout = int(config.get('server_startup_timeout', 300))
+            if wait_for_server_ready(server_url, timeout=server_startup_timeout):
                 run_multiple_clients.main(config)
             else:
                 msg = f"[W{worker_id}] Server non avviato per {dataset_name}|{model_name}. Skipping."
@@ -272,7 +273,7 @@ def run_grid_search_worker(
                     send_telegram(telegram_token, telegram_chat_id,
                                   f"<b>⚠️ FCGS Server timeout — Worker {worker_id} ({pc_name})</b>\n"
                                   f"Config: {dataset_name} | {model_name}\n"
-                                  f"Il server non ha risposto entro 60s.")
+                                  f"Il server non ha risposto entro {server_startup_timeout}s.")
             server_thread.join(timeout=120)
             if server_thread.is_alive():
                 msg = f"[W{worker_id}] Server thread ancora vivo dopo 120s per {dataset_name}|{model_name}."
