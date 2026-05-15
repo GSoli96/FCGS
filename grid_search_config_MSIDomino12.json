@@ -16,6 +16,16 @@
   "weighted_aggregation": true,
   "datasets": [
     {
+      "name": "dataset_multy_sorted_Flair",
+      "path": "dataset/dataset_multy_sorted_Flair",
+      "num_classes": 3
+    },
+    {
+      "name": "dataset_multy_sorted_Flair_augmented",
+      "path": "dataset/dataset_multy_sorted_Flair_augmented",
+      "num_classes": 3
+    },
+    {
       "name": "dataset_HAM1000",
       "path": "dbluigi/dataset_HAM1000/dataset",
       "num_classes": 2

@@ -46,16 +46,6 @@
       "num_classes": 3
     },
     {
-      "name": "dataset_multy_sorted_Flair_augmented",
-      "path": "dataset/dataset_multy_sorted_Flair_augmented",
-      "num_classes": 3
-    },
-    {
-      "name": "dataset_multy_sorted_Flair",
-      "path": "dataset/dataset_multy_sorted_Flair",
-      "num_classes": 3
-    },
-    {
       "name": "brain_tumor",
       "path": "dbluigi/brain_tumor/train",
       "num_classes": 4
