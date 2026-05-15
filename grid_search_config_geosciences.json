@@ -11,6 +11,7 @@
   "base_log_path": "logs",
   "base_plot_path": "static/plots",
   "base_split_data_path": "run_dataset",
+  "round_timeout": 600,
   "early_stop_patience": 5,
   "weighted_aggregation": true,
   "datasets": [
