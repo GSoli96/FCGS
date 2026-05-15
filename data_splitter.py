@@ -1,9 +1,25 @@
 import os
+import stat
 import pandas as pd
 import shutil
 import re
 from sklearn.model_selection import StratifiedKFold, train_test_split
 from typing import List, Dict
+
+
+def _safe_rmtree(path: str) -> None:
+    def _onerror(func, fpath, exc_info):
+        try:
+            os.chmod(fpath, stat.S_IWRITE)
+            func(fpath)
+        except Exception:
+            pass
+    for _ in range(5):
+        try:
+            shutil.rmtree(path, onerror=_onerror)
+            return
+        except OSError:
+            import time; time.sleep(2)
 
 
 class DatasetSplitter:
@@ -129,7 +145,7 @@ class DatasetSplitter:
             for item_name in os.listdir(self.output_base_dir):
                 item_path = os.path.join(self.output_base_dir, item_name)
                 if os.path.isdir(item_path):
-                    shutil.rmtree(item_path)
+                    _safe_rmtree(item_path)
                     print(f"  - Deleted directory: {item_path}")
         print("Clearing complete.")
 

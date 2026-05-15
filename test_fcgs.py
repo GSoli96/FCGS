@@ -707,22 +707,11 @@ class TestFederatedServerWatchdog(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
-# 7b. SOURCE CHECK: static/federated_server.py contiene codice watchdog
+# 7b. SOURCE CHECK: federated_server.py contiene codice watchdog e disconnect
 # ---------------------------------------------------------------------------
 
 class TestStaticServerSource(unittest.TestCase):
     """Test su file sorgente — non richiede torch."""
-
-    def test_static_server_has_watchdog_symbols(self):
-        static_path = os.path.join(PROJECT_ROOT, 'static', 'federated_server.py')
-        self.assertTrue(os.path.exists(static_path), "static/federated_server.py non trovato")
-        with open(static_path) as f:
-            source = f.read()
-        for symbol in ('round_phase', '_last_activity', '_round_timeout',
-                        'clients_selected_for_round', 'clients_submitted_update',
-                        '_watchdog_loop', 'round_timeout'):
-            self.assertIn(symbol, source,
-                          f"'{symbol}' non trovato in static/federated_server.py")
 
     def test_root_server_has_watchdog_symbols(self):
         root_path = os.path.join(PROJECT_ROOT, 'federated_server.py')
@@ -734,22 +723,20 @@ class TestStaticServerSource(unittest.TestCase):
             self.assertIn(symbol, source,
                           f"'{symbol}' non trovato in federated_server.py")
 
-    def test_static_server_has_disconnect_handling(self):
-        static_path = os.path.join(PROJECT_ROOT, 'static', 'federated_server.py')
-        with open(static_path) as f:
+    def test_root_server_has_disconnect_handling(self):
+        root_path = os.path.join(PROJECT_ROOT, 'federated_server.py')
+        with open(root_path) as f:
             source = f.read()
         self.assertIn('_on_disconnect', source)
         self.assertIn('num_clients_per_round', source)
         self.assertIn('expected_eval_count', source)
 
-    def test_static_server_not_identical_to_root(self):
-        """Static e root NON devono essere identici (la static ha differenze)."""
-        with open(os.path.join(PROJECT_ROOT, 'federated_server.py')) as f:
-            root = f.read()
-        with open(os.path.join(PROJECT_ROOT, 'static', 'federated_server.py')) as f:
-            static = f.read()
-        self.assertNotEqual(root, static,
-                            "static e root federated_server.py non devono essere identici")
+    def test_static_folder_has_no_python_files(self):
+        """static/ non deve contenere file .py — sono stati rimossi."""
+        static_dir = os.path.join(PROJECT_ROOT, 'static')
+        py_files = [f for f in os.listdir(static_dir) if f.endswith('.py')]
+        self.assertEqual(py_files, [],
+                         f"Trovati file .py inattesi in static/: {py_files}")
 
 
 # ---------------------------------------------------------------------------

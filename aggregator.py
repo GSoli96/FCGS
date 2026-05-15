@@ -202,26 +202,23 @@ class Aggregator:
         os.makedirs(plots_dir, exist_ok=True)
         plot_paths = []
         timestr = time.strftime('%Y%m%d-%H%M%S')
-        plt.figure()
-        plt.title("Train and Test Loss vs. Rounds")
-        plt.plot(df.index, df['train_loss'], label="Train Loss")
-        plt.plot(df.index, df['test_loss'], label="Test Loss")
-        plt.xlabel("Round");
-        plt.ylabel("Loss");
-        plt.legend()
-        path = os.path.join(plots_dir, f"{timestr}_Loss.png")
-        plt.savefig(path);
-        plt.close()
-        plot_paths.append(path)
-        plt.figure()
-        plt.title("Test Metrics vs. Rounds")
-        plt.plot(df.index, df['test_f1'], label="F1 Score")
-        plt.plot(df.index, df['test_acc'], label="Accuracy")
-        plt.xlabel("Round");
-        plt.ylabel("Score");
-        plt.legend()
-        path = os.path.join(plots_dir, f"{timestr}_Metrics.png")
-        plt.savefig(path);
-        plt.close()
-        plot_paths.append(path)
+        if 'train_loss' in df.columns:
+            plt.figure()
+            plt.title("Train and Test Loss vs. Rounds")
+            plt.plot(df.index, df['train_loss'], label="Train Loss")
+            if 'test_loss' in df.columns:
+                plt.plot(df.index, df['test_loss'], label="Test Loss")
+            plt.xlabel("Round"); plt.ylabel("Loss"); plt.legend()
+            path = os.path.join(plots_dir, f"{timestr}_Loss.png")
+            plt.savefig(path); plt.close()
+            plot_paths.append(path)
+        if 'test_f1' in df.columns and 'test_acc' in df.columns:
+            plt.figure()
+            plt.title("Test Metrics vs. Rounds")
+            plt.plot(df.index, df['test_f1'], label="F1 Score")
+            plt.plot(df.index, df['test_acc'], label="Accuracy")
+            plt.xlabel("Round"); plt.ylabel("Score"); plt.legend()
+            path = os.path.join(plots_dir, f"{timestr}_Metrics.png")
+            plt.savefig(path); plt.close()
+            plot_paths.append(path)
         return plot_paths
