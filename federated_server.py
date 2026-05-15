@@ -280,6 +280,11 @@ class FederatedServer:
         socketio.stop() requires a Werkzeug request context (removed in Werkzeug 2.x).
         os.kill(SIGINT) interrupts the main thread instead of the server thread.
         ctypes raises SystemExit only in the server thread, leaving the worker unaffected."""
+        if self.aggregator.run_summary is None and self.aggregator.metrics_history:
+            try:
+                self.aggregator.save_results()
+            except Exception as e:
+                self.logger.error("Emergency save_results failed: %s", e)
         self.logger.info("Shutting down the server.")
         thread_ident = getattr(self, '_run_thread_ident', None)
         def _do_stop():

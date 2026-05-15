@@ -5,6 +5,7 @@ import itertools
 import traceback
 import socket as _socket
 import shutil
+import stat
 import requests
 from requests.exceptions import ConnectionError
 import socketio
@@ -52,17 +53,31 @@ def get_config_fingerprint(config: Dict, keys: Set[str]) -> FrozenSet[Tuple[str,
             fingerprint_items.append((key, str(config[key])))
     return frozenset(fingerprint_items)
 
+def _safe_rmtree(path: str) -> None:
+    def _onerror(func, fpath, exc_info):
+        try:
+            os.chmod(fpath, stat.S_IWRITE)
+            func(fpath)
+        except Exception:
+            pass
+    for _ in range(5):
+        try:
+            shutil.rmtree(path, onerror=_onerror)
+            return
+        except OSError:
+            time.sleep(2)
+
+
 def wait_for_port_free(host: str, port: int, timeout: int = 120) -> bool:
+    # Bind-based check: unico modo affidabile su Windows (TIME_WAIT non blocca connect ma blocca bind)
     deadline = time.time() + timeout
     while time.time() < deadline:
         try:
             with _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM) as s:
-                s.settimeout(1)
-                if s.connect_ex((host, port)) != 0:
-                    return True
-        except Exception:
-            return True
-        time.sleep(3)
+                s.bind((host, port))
+                return True
+        except OSError:
+            time.sleep(3)
     return False
 
 
@@ -298,7 +313,7 @@ def run_grid_search_worker(
                                   f"Config: {dataset_name} | {model_name}\n"
                                   f"Server crashato prima di inizializzarsi.")
             if os.path.exists(worker_splitting_dir):
-                shutil.rmtree(worker_splitting_dir)
+                _safe_rmtree(worker_splitting_dir)
                 print(f"[W{worker_id}] Cleaned up split dir: {worker_splitting_dir}")
             time.sleep(1)
 
