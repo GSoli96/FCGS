@@ -1,4 +1,5 @@
 import json
+import sys
 import threading
 import time
 import itertools
@@ -22,7 +23,7 @@ import federated_server
 import run_multiple_clients
 
 NUM_PARALLEL_EXECUTIONS = 12
-GRID_SEARCH_CONFIG_PATH = 'grid_search_config.json'
+GRID_SEARCH_CONFIG_PATH = f'grid_search_config_{PCNAME.name}.json'
 VERBOSE_DUPLICATE_CHECK = False
 
 
@@ -369,6 +370,12 @@ def _compute_num_workers(config: dict) -> int:
 
 
 def main():
+    if not os.path.exists(GRID_SEARCH_CONFIG_PATH):
+        print(f"ERRORE: nessun file di configurazione trovato per la macchina '{PCNAME.name}'.")
+        print(f"        Atteso: {GRID_SEARCH_CONFIG_PATH}")
+        print(f"        Crea il file oppure passalo come argomento: python federated_grid_search.py <config.json>")
+        sys.exit(1)
+    print(f"=== Configurazione: {GRID_SEARCH_CONFIG_PATH} ===")
     base_grid_config = load_json(GRID_SEARCH_CONFIG_PATH)
     csv_lock = multiprocessing.Lock()
     task_queue = multiprocessing.JoinableQueue()

@@ -72,7 +72,10 @@ class FederatedServer:
             self.logger.info("Encryption mode enabled: %s. The server will operate key-agnostic.", self.encryption_mode)
 
         # --- Flask & SocketIO Setup ---
-        self.app = Flask(__name__)
+        _root = os.path.dirname(os.path.abspath(__file__))
+        self.app = Flask(__name__,
+                         template_folder=os.path.join(_root, 'templates'),
+                         static_folder=os.path.join(_root, 'static'))
         self.socketio = SocketIO(self.app, ping_timeout=3600, ping_interval=5, max_http_buffer_size=int(1e32))
         self._register_routes_and_handlers()
 
