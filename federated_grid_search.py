@@ -7,6 +7,8 @@ import traceback
 import socket as _socket
 import shutil
 import stat
+import subprocess
+import signal as _signal
 import requests
 from requests.exceptions import ConnectionError
 import socketio
@@ -22,7 +24,7 @@ from trusted_authority import TrustedAuthority
 import federated_server
 import run_multiple_clients
 
-NUM_PARALLEL_EXECUTIONS = 12
+NUM_PARALLEL_EXECUTIONS = 20
 GRID_SEARCH_CONFIG_PATH = f'grid_search_config_{PCNAME.name}.json'
 VERBOSE_DUPLICATE_CHECK = False
 
@@ -69,17 +71,168 @@ def _safe_rmtree(path: str) -> None:
             time.sleep(2)
 
 
+def _get_pid_on_port(port: int) -> int:
+    """Returns PID listening on the given TCP port, or 0 if not found. Cross-platform."""
+    if sys.platform == 'win32':
+        try:
+            result = subprocess.run(['netstat', '-ano'], capture_output=True, text=True, timeout=10)
+            for line in result.stdout.splitlines():
+                if 'LISTENING' in line:
+                    parts = line.split()
+                    if len(parts) >= 5 and parts[3] == 'LISTENING':
+                        local_addr = parts[1]
+                        if local_addr.endswith(f':{port}') or f':{port}' in local_addr:
+                            try:
+                                return int(parts[-1])
+                            except ValueError:
+                                pass
+        except Exception:
+            pass
+    else:
+        # Linux/macOS: prova ss prima, poi lsof come fallback
+        try:
+            import re
+            result = subprocess.run(
+                ['ss', '-tlnp', f'sport = :{port}'],
+                capture_output=True, text=True, timeout=10
+            )
+            for line in result.stdout.splitlines():
+                if f':{port}' in line:
+                    m = re.search(r'pid=(\d+)', line)
+                    if m:
+                        return int(m.group(1))
+        except Exception:
+            pass
+        try:
+            result = subprocess.run(
+                ['lsof', '-ti', f':{port}'],
+                capture_output=True, text=True, timeout=10
+            )
+            first = result.stdout.strip().split('\n')[0]
+            if first.isdigit():
+                return int(first)
+        except Exception:
+            pass
+    return 0
+
+
+def _is_python_process(pid: int) -> bool:
+    """Returns True if the given PID is a Python interpreter process. Cross-platform."""
+    if sys.platform == 'win32':
+        try:
+            result = subprocess.run(
+                ['tasklist', '/FI', f'PID eq {pid}', '/FO', 'CSV', '/NH'],
+                capture_output=True, text=True, timeout=10
+            )
+            return 'python' in result.stdout.lower()
+        except Exception:
+            return False
+    else:
+        # Linux: leggi /proc/<pid>/cmdline
+        try:
+            with open(f'/proc/{pid}/cmdline', 'rb') as f:
+                cmdline = f.read().decode('utf-8', errors='replace').replace('\x00', ' ')
+            return 'python' in cmdline.lower()
+        except Exception:
+            pass
+        try:
+            result = subprocess.run(
+                ['ps', '-p', str(pid), '-o', 'comm='],
+                capture_output=True, text=True, timeout=10
+            )
+            return 'python' in result.stdout.lower()
+        except Exception:
+            return False
+
+
+def _kill_process(pid: int) -> None:
+    """Force-kills a process by PID. Cross-platform."""
+    if sys.platform == 'win32':
+        subprocess.run(['taskkill', '/F', '/PID', str(pid)], capture_output=True, timeout=10)
+    else:
+        os.kill(pid, _signal.SIGKILL)
+
+
+def find_free_port(host: str, preferred_port: int, max_scan: int = 200) -> int:
+    """Returns the first free TCP port starting from preferred_port.
+    Tries up to max_scan consecutive ports. Falls back to the OS-assigned port if none found."""
+    for candidate in range(preferred_port, preferred_port + max_scan):
+        try:
+            with _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM) as s:
+                s.setsockopt(_socket.SOL_SOCKET, _socket.SO_REUSEADDR, 1)
+                s.bind((host, candidate))
+                return candidate
+        except OSError:
+            continue
+    # Last resort: let the OS pick a free port
+    with _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM) as s:
+        s.bind((host, 0))
+        return s.getsockname()[1]
+
+
 def wait_for_port_free(host: str, port: int, timeout: int = 120) -> bool:
-    # Bind-based check: unico modo affidabile su Windows (TIME_WAIT non blocca connect ma blocca bind)
+    # Bind-based check: unico modo affidabile (TIME_WAIT non blocca connect ma blocca bind)
+    # After 30s of waiting, actively kill the Python process holding the port.
     deadline = time.time() + timeout
+    kill_after = time.time() + 30
+    kill_attempted = False
     while time.time() < deadline:
         try:
             with _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM) as s:
+                s.setsockopt(_socket.SOL_SOCKET, _socket.SO_REUSEADDR, 1)
                 s.bind((host, port))
                 return True
         except OSError:
+            if not kill_attempted and time.time() >= kill_after:
+                kill_attempted = True
+                pid = _get_pid_on_port(port)
+                if pid and pid != os.getpid() and _is_python_process(pid):
+                    print(f"  [PortFree] Port {port} held by Python PID {pid}. Force-terminating...")
+                    try:
+                        _kill_process(pid)
+                        print(f"  [PortFree] PID {pid} killed. Waiting for port to release...")
+                        time.sleep(5)
+                        continue
+                    except Exception as e:
+                        print(f"  [PortFree] Could not terminate PID {pid}: {e}")
             time.sleep(3)
     return False
+
+
+def pre_download_model_weights(model_names: set) -> None:
+    """
+    Downloads all pretrained weights to the local torchvision disk cache before workers start.
+    Worker processes (spawned fresh) then load from cache instantly — no download delay.
+    """
+    try:
+        import torchvision.models as tv_models
+    except ImportError:
+        print("[PreDownload] torchvision not available, skipping pre-download.")
+        return
+
+    weight_map = {
+        'GoogLeNet': (tv_models.googlenet, tv_models.GoogLeNet_Weights.IMAGENET1K_V1),
+        'AlexNet':   (tv_models.alexnet,    tv_models.AlexNet_Weights.IMAGENET1K_V1),
+        'ResNet18':  (tv_models.resnet18,   tv_models.ResNet18_Weights.IMAGENET1K_V1),
+        'ResNet34':  (tv_models.resnet34,   tv_models.ResNet34_Weights.IMAGENET1K_V1),
+        'ResNet50':  (tv_models.resnet50,   tv_models.ResNet50_Weights.IMAGENET1K_V1),
+        'ResNet101': (tv_models.resnet101,  tv_models.ResNet101_Weights.IMAGENET1K_V1),
+    }
+
+    print("\n=== Pre-downloading model weights (CPU cache check) ===")
+    for name in sorted(model_names):
+        if name not in weight_map:
+            print(f"[PreDownload] {name}: no pretrained weights needed (skipping).")
+            continue
+        fn, weights_enum = weight_map[name]
+        print(f"[PreDownload] Checking {name}...", flush=True)
+        try:
+            model = fn(weights=weights_enum)
+            del model
+            print(f"[PreDownload] {name} weights ready.")
+        except Exception as e:
+            print(f"[PreDownload] WARNING — could not pre-load {name}: {e}")
+    print("=== Pre-download complete ===\n")
 
 
 def wait_for_server_ready(url, timeout=60):
@@ -129,22 +282,21 @@ def generate_configurations(base_config: Dict, search_space: Dict) -> Generator[
         yield config
 
 
-def start_server_thread(config: Dict, server_instance_ref: List) -> None:
-    worker_id = config.get('worker_id', 'N/A')
-    port = config['port']
+def _server_process_target(config: Dict, result_queue: multiprocessing.Queue) -> None:
+    """Gira il FederatedServer in un subprocess separato e mette run_summary nella queue."""
     try:
         server = federated_server.FederatedServer(config)
-        server_instance_ref.append(server)
-        server.run()
+        try:
+            server.run()
+        except SystemExit:
+            # _shutdown_server usa ctypes per sollevare SystemExit nel thread main
+            # del subprocess. Lo catturiamo per poter ancora salvare i risultati.
+            pass
+        run_summary = server.aggregator.get_run_summary()
+        result_queue.put(run_summary)
     except Exception as e:
-        tb_str = traceback.format_exc()
-        print(f"[W{worker_id}] SERVER CRASH on port {port}: {e}\n{tb_str}")
-        send_telegram(
-            config.get('telegram_bot_token', ''),
-            config.get('telegram_chat_id', ''),
-            f"<b>⚠️ FCGS SERVER CRASH — Worker {worker_id} ({PCNAME.name})</b>\n"
-            f"Port: {port}\n<code>{str(e)[:400]}</code>"
-        )
+        print(f"[ServerProc W{config.get('worker_id','?')}] Error: {e}\n{traceback.format_exc()}")
+        result_queue.put(None)
 
 
 def start_ta_thread(config: Dict, ta_instance_ref: List) -> None:
@@ -159,6 +311,22 @@ def start_ta_thread(config: Dict, ta_instance_ref: List) -> None:
         ta.run()
     except Exception as e:
         print(f"[W{worker_id}] TA CRASH: {e}\n{traceback.format_exc()}")
+
+
+def _ta_process_target(config: Dict) -> None:
+    """Runs the Trusted Authority in a separate subprocess."""
+    worker_id = config.get('worker_id', 'N/A')
+    try:
+        from trusted_authority import TrustedAuthority
+        ta = TrustedAuthority(
+            host=config['ip_address'],
+            port=config['ta_port'],
+            he_backend=config.get('he_backend', 'paillier')
+        )
+        ta.run()
+    except Exception as e:
+        import traceback
+        print(f"[TAProc W{worker_id}] Error: {e}\n{traceback.format_exc()}")
 
 
 def _heartbeat_loop(
@@ -212,43 +380,29 @@ def run_grid_search_worker(
         model_name = config.get('model_name', 'N/A')
         print(f"[W{worker_id}] START {dataset_name} | {model_name}")
 
+        worker_splitting_dir = None
         try:
             run_identifier = f"{dataset_name}_run_{worker_id}_{model_name}"
             worker_splitting_dir = os.path.join(config['base_split_data_path'] + f'_{pc_name}', run_identifier)
             worker_log_dir = os.path.join(config['base_log_path'] + f'_{pc_name}', run_identifier)
             worker_plot_dir = os.path.join(config['base_plot_path'] + f'_{pc_name}', run_identifier)
             worker_metrics_dir = os.path.join(config['base_csv_path'] + f'_{pc_name}', "runs")
-            os.makedirs(worker_splitting_dir, exist_ok=True)
+            # worker_splitting_dir viene creato DOPO i port check per non lasciare
+            # directory orfane quando la porta è occupata e il worker fa continue
             os.makedirs(worker_log_dir, exist_ok=True)
             os.makedirs(worker_plot_dir, exist_ok=True)
             os.makedirs(worker_metrics_dir, exist_ok=True)
 
             config['worker_id'] = worker_id
-            config['port'] = base_port + worker_id * 2
-            config['ta_port'] = base_port + worker_id * 2 + 1
+            preferred_port = base_port + worker_id * 2
+            config['port'] = find_free_port(config['ip_address'], preferred_port)
+            if config['port'] != preferred_port:
+                print(f"[W{worker_id}] Port {preferred_port} busy, using {config['port']} instead.")
             config['splitting_dir'] = worker_splitting_dir
             config['log_dir'] = worker_log_dir
             config['plot_dir'] = worker_plot_dir
             config['run_metrics_output_path'] = worker_metrics_dir
             config["MIN_NUM_WORKERS"] = int(config['num_clients'] * config['models_percentage'])
-
-            ta_instance_ref = []
-            server_instance_ref = []
-            use_encryption = config.get('encryption_mode', 'no_encryption') != 'no_encryption'
-            ta_thread = None
-            if use_encryption:
-                if not wait_for_port_free(config['ip_address'], config['ta_port'], timeout=180):
-                    msg = f"[W{worker_id}] TA port {config['ta_port']} still occupied after 180s. Skipping {dataset_name}|{model_name}."
-                    print(msg)
-                    if telegram_token and telegram_chat_id:
-                        send_telegram(telegram_token, telegram_chat_id,
-                                      f"<b>⚠️ FCGS TA Port busy — Worker {worker_id} ({pc_name})</b>\n"
-                                      f"Config: {dataset_name} | {model_name}\n"
-                                      f"Porta TA {config['ta_port']} occupata dopo 180s. Skipping.")
-                    continue
-                ta_thread = threading.Thread(target=start_ta_thread, args=(config, ta_instance_ref))
-                ta_thread.start()
-                time.sleep(3)
 
             if not wait_for_port_free(config['ip_address'], config['port'], timeout=180):
                 msg = f"[W{worker_id}] Port {config['port']} still occupied after 180s. Skipping {dataset_name}|{model_name}."
@@ -260,11 +414,22 @@ def run_grid_search_worker(
                                   f"Porta {config['port']} occupata dopo 180s. Skipping.")
                 continue
 
-            server_thread = threading.Thread(target=start_server_thread, args=(config, server_instance_ref))
-            server_thread.start()
+            # Porta libera: ora è sicuro creare la directory di split
+            os.makedirs(worker_splitting_dir, exist_ok=True)
+
+            # Il server gira in un subprocess separato così, se si blocca,
+            # possiamo killarlo con SIGKILL e liberare la porta immediatamente.
+            result_queue = multiprocessing.Queue()
+            server_process = multiprocessing.Process(
+                target=_server_process_target,
+                args=(config, result_queue),
+                daemon=True
+            )
+            server_process.start()
             server_url = f"http://{config['ip_address']}:{config['port']}"
-            server_startup_timeout = int(config.get('server_startup_timeout', 300))
-            if wait_for_server_ready(server_url, timeout=server_startup_timeout):
+            server_ready_timeout = config.get('server_ready_timeout', 60)
+            server_join_timeout = config.get('server_join_timeout', 120)
+            if wait_for_server_ready(server_url, timeout=server_ready_timeout):
                 run_multiple_clients.main(config)
             else:
                 msg = f"[W{worker_id}] Server non avviato per {dataset_name}|{model_name}. Skipping."
@@ -273,47 +438,32 @@ def run_grid_search_worker(
                     send_telegram(telegram_token, telegram_chat_id,
                                   f"<b>⚠️ FCGS Server timeout — Worker {worker_id} ({pc_name})</b>\n"
                                   f"Config: {dataset_name} | {model_name}\n"
-                                  f"Il server non ha risposto entro {server_startup_timeout}s.")
-            server_thread.join(timeout=120)
-            if server_thread.is_alive():
-                msg = f"[W{worker_id}] Server thread ancora vivo dopo 120s per {dataset_name}|{model_name}."
+                                  f"Il server non ha risposto entro {server_ready_timeout}s.")
+            server_process.join(timeout=server_join_timeout)
+            if server_process.is_alive():
+                msg = f"[W{worker_id}] Server process ancora vivo dopo {server_join_timeout}s per {dataset_name}|{model_name}. SIGKILL."
                 print(msg)
                 if telegram_token and telegram_chat_id:
                     send_telegram(telegram_token, telegram_chat_id,
                                   f"<b>⚠️ FCGS Server hung — Worker {worker_id} ({pc_name})</b>\n"
                                   f"Config: {dataset_name} | {model_name}\n"
-                                  f"Server thread non terminato dopo 120s.")
-                wait_for_port_free(config['ip_address'], config['port'], timeout=120)
-            if use_encryption and ta_thread is not None:
-                try:
-                    sio_client = socketio.Client(reconnection=False)
-                    sio_client.connect(f"http://{config['ip_address']}:{config['ta_port']}", transports=['websocket'])
-                    sio_client.emit('shutdown_ta')
-                    time.sleep(1)
-                    sio_client.disconnect()
-                except Exception as e:
-                    print(f"[W{worker_id}] Could not shutdown TA: {e}")
-                ta_thread.join(timeout=15)
-            if server_instance_ref:
-                run_summary = server_instance_ref[0].aggregator.get_run_summary()
-                if run_summary:
-                    append_results_to_csv(config['shared_csv_path'], run_summary, csv_lock)
-                else:
-                    msg = f"[W{worker_id}] run_summary None per {dataset_name}|{model_name}."
-                    print(msg)
-                    if telegram_token and telegram_chat_id:
-                        send_telegram(telegram_token, telegram_chat_id,
-                                      f"<b>⚠️ FCGS run_summary None — Worker {worker_id} ({pc_name})</b>\n"
-                                      f"Config: {dataset_name} | {model_name}\n"
-                                      f"Training completato ma nessun risultato salvato.")
+                                  f"Server non terminato dopo {server_join_timeout}s. Forzato SIGKILL.")
+                server_process.kill()
+                server_process.join(timeout=10)
+            try:
+                run_summary = result_queue.get(timeout=5)
+            except Exception:
+                run_summary = None
+            if run_summary:
+                append_results_to_csv(config['shared_csv_path'], run_summary, csv_lock)
             else:
-                msg = f"[W{worker_id}] server_instance_ref vuoto per {dataset_name}|{model_name} (crash avvio server)."
+                msg = f"[W{worker_id}] run_summary None per {dataset_name}|{model_name} (crash o kill server)."
                 print(msg)
                 if telegram_token and telegram_chat_id:
                     send_telegram(telegram_token, telegram_chat_id,
-                                  f"<b>⚠️ FCGS Server crash — Worker {worker_id} ({pc_name})</b>\n"
+                                  f"<b>⚠️ FCGS run_summary None — Worker {worker_id} ({pc_name})</b>\n"
                                   f"Config: {dataset_name} | {model_name}\n"
-                                  f"Server crashato prima di inizializzarsi.")
+                                  f"Nessun risultato: server crashato o killato.")
             if os.path.exists(worker_splitting_dir):
                 _safe_rmtree(worker_splitting_dir)
                 print(f"[W{worker_id}] Cleaned up split dir: {worker_splitting_dir}")
@@ -352,6 +502,8 @@ def run_grid_search_worker(
                               f"<b>⚠️ FCGS ERRORE — Worker {worker_id} ({pc_name})</b>\n"
                               f"Config: {dataset_name} | {model_name}\n"
                               f"<code>{str(e)[:500]}</code>")
+            if worker_splitting_dir is not None and os.path.exists(worker_splitting_dir):
+                _safe_rmtree(worker_splitting_dir)
         finally:
             task_queue.task_done()
 
@@ -381,6 +533,11 @@ def main():
     csv_lock = multiprocessing.Lock()
     task_queue = multiprocessing.JoinableQueue()
     pc_name = PCNAME.name
+
+    # Non cancelliamo le directory di split all'avvio: ogni worker le ripulisce
+    # internamente (tramite _clear_existing_split) all'inizio di ogni iterazione.
+    # Il cleanup globale causa FileNotFoundError se un'altra istanza è ancora attiva.
+
     base_csv_path = base_grid_config['base_csv_path']+f'_{pc_name}'
     os.makedirs(base_csv_path, exist_ok=True)
     os.makedirs(base_grid_config.get('base_log_path', 'logs')+f'_{pc_name}', exist_ok=True)
@@ -491,6 +648,9 @@ def main():
                       f"Config da eseguire: <b>{configs_to_run_count}</b>\n"
                       f"Workers paralleli: {num_workers}\n"
                       f"Notifica ogni {notification_interval} completamenti.")
+    # Pre-download weights for all models in the search space before spawning workers
+    pre_download_model_weights(set(model_specific_search_space.keys()))
+
     processes = []
     print(f"\n=== Starting {num_workers} Grid Search workers ===")
     base_port = base_grid_config['port']
@@ -501,6 +661,16 @@ def main():
         process = multiprocessing.Process(target=run_grid_search_worker, args=(i, *worker_args))
         processes.append(process)
         process.start()
+
+    def _shutdown_all(signum=None, frame=None):
+        print("\n[FCGS] Signal received. Terminating all worker processes...")
+        for p in processes:
+            if p.is_alive():
+                p.kill()
+        sys.exit(0)
+
+    _signal.signal(_signal.SIGTERM, _shutdown_all)
+    _signal.signal(_signal.SIGINT, _shutdown_all)
 
     heartbeat_stop = threading.Event()
     heartbeat_interval = int(base_grid_config.get('heartbeat_interval_hours', 4)) * 3600

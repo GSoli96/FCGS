@@ -31,7 +31,14 @@ class FederatedClient:
     Implements the client-side logic for federated learning.
     """
 
+    # Process-wide semaphore to limit concurrent training/validation across all clients in this process.
+    # Allowing 1 or 2 concurrent executions is optimal to prevent GPU OOM and CPU contention.
+    _training_semaphore = None
+
     def __init__(self, config: Dict, dataset_path: str):
+        if FederatedClient._training_semaphore is None:
+            limit = int(config.get('max_concurrent_client_trainings', 2))
+            FederatedClient._training_semaphore = threading.Semaphore(limit)
         # --- MODIFICA CHIAVE: Il tipo è ora ModelManager ---
         self.local_model: ModelManager = None
         self.config: Dict = config
@@ -51,7 +58,7 @@ class FederatedClient:
 
         self._training_active = threading.Event()
 
-        self.sio = socketio.Client(logger=False, engineio_logger=False, request_timeout=10, reconnection=True)
+        self.sio = socketio.Client(logger=False, engineio_logger=False, request_timeout=10, reconnection=False)
         self._register_event_handlers()
         self.connect_to_server()
 
@@ -119,7 +126,12 @@ class FederatedClient:
         if total_size > 0:
             return [w / total_size for w in plaintext_sum]
         else:
-            self.logger.warning("Total training size is 0. Using weights as is.")
+            # Round 0 always sends total_size=0 (expected); only warn after that.
+            round_number = data.get('round_number', -1)
+            if round_number == 0:
+                self.logger.info("Round 0: total_training_size is 0 (expected). Using weights as is.")
+            else:
+                self.logger.warning("Total training size is 0 in round %d. Using weights as is.", round_number)
             return plaintext_sum
 
     def connect_to_server(self) -> None:
@@ -130,6 +142,10 @@ class FederatedClient:
             self.logger.info("Sending wake up message to the server.")
             self.sio.emit('client_wake_up')
             self.sio.wait()
+            # Wait for any in-progress training to finish before returning,
+            # so the caller can safely clean up the dataset directory.
+            while self._training_active.is_set():
+                time.sleep(0.5)
         except socketio.exceptions.ConnectionError as e:
             self.logger.error("Failed to connect to the server: %s", e)
             return
@@ -158,13 +174,17 @@ class FederatedClient:
 
     def _on_init(self, data: Dict):
         self.logger.info("Received initialization signal from server.")
+        threading.Thread(target=self._on_init_worker, args=(data,), daemon=True).start()
+
+    def _on_init_worker(self, data: Dict):
         if self.encryption_mode != 'no_encryption':
             ta_address = data['ta_address']
-            self.logger.info("Connecting to Trusted Authority at %s.", ta_address)
-            ta_sio = socketio.Client(reconnection=False)
-
-            @ta_sio.on('distribute_keys')
-            def on_receive_keys(key_data):
+            self.logger.info("Fetching keys from Trusted Authority at %s.", ta_address)
+            try:
+                import requests as _requests
+                response = _requests.get(f"{ta_address}/keys", timeout=120)
+                response.raise_for_status()
+                key_data = response.json()
                 self.logger.info("Keys received from Trusted Authority (backend=%s).", key_data.get('backend', 'paillier'))
                 if key_data.get('backend') in ('ckks', 'bfv'):
                     import tenseal as ts
@@ -175,16 +195,6 @@ class FederatedClient:
                 else:
                     self.paillier_pubkey = pickle_string_to_object(key_data['pubkey'])
                     self.paillier_privkey = pickle_string_to_object(key_data['privkey'])
-                self.keys_received_event.set()
-                ta_sio.disconnect()
-
-            try:
-                ta_sio.connect(ta_address, transports=['websocket'])
-                ta_sio.emit('request_keys')
-                if not self.keys_received_event.wait(timeout=30):
-                    self.logger.error("CRITICAL: Did not receive keys from TA within timeout.")
-                    self.sio.disconnect()
-                    return
             except Exception as e:
                 self.logger.error("CRITICAL: Failed to get keys from TA: %s", e)
                 self.sio.disconnect()
@@ -194,8 +204,6 @@ class FederatedClient:
 
     def _initialize_model_and_report_ready(self):
         self.logger.info("Initializing local model.")
-
-        # --- MODIFICA CHIAVE: Istanza del nuovo ModelManager ---
         self.local_model = ModelManager(
             config=self.config,
             dataset_path=self.dataset_path
@@ -207,7 +215,13 @@ class FederatedClient:
         ready_data = {'samples_per_class': object_to_pickle_string(samples_per_class)}
         if self.encryption_mode != 'no_encryption' and self.he_backend in ('ckks', 'bfv'):
             ready_data['ckks_public_context'] = codecs.encode(self.ckks_public_context_bytes, 'base64').decode()
-        self.sio.emit('client_ready', ready_data)
+        if not self.sio.connected:
+            self.logger.error("Connection lost before sending 'client_ready'. Aborting.")
+            return
+        try:
+            self.sio.emit('client_ready', ready_data)
+        except Exception as e:
+            self.logger.error("Failed to send 'client_ready' (connection lost during emit): %s", e)
 
     def _on_distribute_calibration(self, data: Dict):
         self.logger.info("Received static calibration term from the server.")
@@ -234,11 +248,12 @@ class FederatedClient:
 
             self.local_model.set_weights(averaged_weights)
 
-            _, train_map, train_loss, train_size = self.local_model.train(
-                epochs=data['epochs'], lr=data['learning_rate'], batch_size=data['batch_size'],
-                algorithm=self.config.get("aggregation_algorithm", "FedAvg"),
-                global_weights=averaged_weights, mu=self.config.get("fedprox_mu", 0.0)
-            )
+            with FederatedClient._training_semaphore:
+                _, train_map, train_loss, train_size = self.local_model.train(
+                    epochs=data['epochs'], lr=data['learning_rate'], batch_size=data['batch_size'],
+                    algorithm=self.config.get("aggregation_algorithm", "FedAvg"),
+                    global_weights=averaged_weights, mu=self.config.get("fedprox_mu", 0.0)
+                )
             local_weights = self.local_model.get_weights()
 
             if self.encryption_mode != 'no_encryption':
@@ -261,6 +276,9 @@ class FederatedClient:
                 'train_size': train_size, 'weights': object_to_pickle_string(weights_to_send)
             }
             self.logger.info("Worker thread: Sending client update for round %s.", data['round_number'])
+            if not self.sio.connected:
+                self.logger.warning("Worker thread: socket disconnected before sending update for round %s. Aborting.", data['round_number'])
+                return
             self.sio.emit('client_update', response)
             self.logger.info("--- Worker thread Round %s Training Summary ---", data['round_number'])
             self.logger.info("Client Train Loss: %.4f", train_loss)
@@ -268,6 +286,13 @@ class FederatedClient:
 
         except Exception as e:
             self.logger.error("An error occurred in the update worker thread: %s", e, exc_info=True)
+            # Disconnect so the server's dropout handler fires immediately instead of
+            # waiting for the watchdog timeout (which could be up to round_timeout seconds).
+            try:
+                if self.sio.connected:
+                    self.sio.disconnect()
+            except Exception:
+                pass
         finally:
             self._training_active.clear()
 
@@ -283,7 +308,8 @@ class FederatedClient:
 
         self.local_model.set_weights(final_weights)
         self.logger.info("Evaluating the final model.")
-        valid_loss, metric_score, _, test_size = self.local_model.validate(data['batch_size'])
+        with FederatedClient._training_semaphore:
+            valid_loss, metric_score, _, test_size = self.local_model.validate(data['batch_size'])
         response = {
             'test_loss': valid_loss, 'test_f1': metric_score['f1_score'],
             'test_acc': metric_score['accuracy'], 'test_prec': metric_score['precision'],
