@@ -176,9 +176,8 @@ fcgs.pid
 monitor.pid
 .monitor_last_telegram
 
-# Stress test temporanei
-geosciences_stress_test/logs/
-geosciences_stress_test/reports/
+# Stress test — solo per geosciences, non sugli altri PC
+geosciences_stress_test/
 
 # File di output runtime nella root
 fcgs_stdout.log

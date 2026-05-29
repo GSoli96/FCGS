@@ -636,10 +636,16 @@ def run_grid_search_worker(
             # Esegui lo split REALE prima di avviare il server — così MIN_NUM_WORKERS
             # riflette i client effettivi dopo I/O (non una stima dry-run che ignora
             # fallimenti di copia su Windows sotto carico).
+            _dataset_abs = os.path.join(str(_PROJECT_ROOT), config['dataset_path'])
+            if not os.path.isdir(_dataset_abs):
+                logger.warning(f"[W{worker_id}] Dataset non trovato: {_dataset_abs}. "
+                               f"Skipping {dataset_name}|{model_name}.")
+                _safe_rmtree(worker_splitting_dir)
+                continue
             from data_splitter import DatasetSplitter
             _splitter = DatasetSplitter(
                 output_base_dir=worker_splitting_dir,
-                source_images_dir=config['dataset_path'],
+                source_images_dir=_dataset_abs,
                 num_clients=config['num_clients'],
             )
             actual_clients = _splitter.split_dataset()
