@@ -1,7 +1,7 @@
 # ============================================================
-# Dipendenze Linux per il progetto Federated Learning FCGS
+# Dipendenze Windows per il progetto Federated Learning FCGS
 # Installazione:
-#   pip install -r requirements_linux.txt
+#   pip install -r requirements_windows.txt
 #   pip install torch torchvision --index-url https://download.pytorch.org/whl/cu126
 # ============================================================
 

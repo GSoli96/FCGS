@@ -1,5 +1,6 @@
 import os
 import stat
+import time
 import pandas as pd
 import shutil
 import re
@@ -20,6 +21,35 @@ def _safe_rmtree(path: str) -> None:
             return
         except OSError:
             import time; time.sleep(2)
+
+
+def compute_effective_clients(source_images_dir: str, num_clients: int) -> int:
+    """
+    Stima quanti client DatasetSplitter creerà effettivamente, senza copiare file.
+    Usa la stessa logica di split_dataset(): min(min_class_count, num_clients).
+    Ritorna num_clients se il dataset non è accessibile.
+    """
+    try:
+        class_dirs = [d for d in os.listdir(source_images_dir)
+                      if os.path.isdir(os.path.join(source_images_dir, d))]
+        if not class_dirs:
+            return num_clients
+        min_count = None
+        IMAGE_EXTS = ('.png', '.jpg', '.jpeg', '.bmp', '.gif')
+        for d in class_dirs:
+            class_path = os.path.join(source_images_dir, d)
+            try:
+                n = sum(1 for f in os.listdir(class_path)
+                        if f.lower().endswith(IMAGE_EXTS))
+                if min_count is None or n < min_count:
+                    min_count = n
+            except OSError:
+                pass
+        if min_count is None or min_count == 0:
+            return num_clients
+        return min(min_count, num_clients)
+    except Exception:
+        return num_clients
 
 
 class DatasetSplitter:
@@ -134,10 +164,16 @@ class DatasetSplitter:
             destination_image_path = os.path.join(destination_dir, safe_filename)
 
             if os.path.exists(source_image_path):
-                try:
-                    shutil.copy(source_image_path, destination_image_path)
-                except OSError as e:
-                    print(f"Warning: Could not copy '{source_image_path}': {e}. Skipping.")
+                # Retry up to 3 times — heavy concurrent I/O on Windows can cause transient failures
+                for _attempt in range(3):
+                    try:
+                        shutil.copy(source_image_path, destination_image_path)
+                        break
+                    except OSError as e:
+                        if _attempt < 2:
+                            time.sleep(0.05 * (_attempt + 1))
+                        else:
+                            print(f"Warning: Could not copy '{source_image_path}' after 3 attempts: {e}. Skipping.")
             else:
                 print(f"Warning: Source image not found and will be skipped: {source_image_path}")
 
@@ -155,13 +191,12 @@ class DatasetSplitter:
                     print(f"  - Deleted directory: {item_path}")
         print("Clearing complete.")
 
-    def split_dataset(self, validation_split_size: float = 0.1) -> None:
+    def split_dataset(self, validation_split_size: float = 0.1) -> int:
         """
         Performs the main dataset splitting operation.
 
-        It first clears any previous splits, then uses StratifiedKFold to divide
-        the data among clients, and for each client's data, performs a further
-        split into training and validation sets.
+        Ritorna il numero effettivo di client creati (puo' essere < num_clients
+        se il dataset ha troppe poche immagini per classe).
         """
         self._clear_existing_split()
 
@@ -177,8 +212,8 @@ class DatasetSplitter:
 
         skf = StratifiedKFold(n_splits=effective_splits, shuffle=True, random_state=42)
 
-        # L'indice del DataFrame viene usato per lo split
         X = self.dataframe.index
+        clients_created = 0
 
         for i, (_, client_indices) in enumerate(skf.split(X, y)):
             client_dir = os.path.join(self.output_base_dir, f"client_{i}")
@@ -201,8 +236,33 @@ class DatasetSplitter:
                 train_indices = client_indices[:-1]
                 valid_indices = client_indices[-1:]
 
-            # Usiamo gli indici del DataFrame per copiare i file
             self._copy_images(self.dataframe.index[train_indices], client_dir, "train")
             self._copy_images(self.dataframe.index[valid_indices], client_dir, "valid")
-            print(f"  - Created train set with {len(train_indices)} samples.")
-            print(f"  - Created valid set with {len(valid_indices)} samples.")
+            n_train = len(train_indices)
+            n_valid = len(valid_indices)
+            print(f"  - Created train set with {n_train} samples.")
+            print(f"  - Created valid set with {n_valid} samples.")
+            if n_train == 0:
+                print(f"  WARNING: client_{i} ha 0 immagini di training! "
+                      f"Questo causa 'Total training size is 0' sul server.")
+            clients_created += 1
+
+        if clients_created < self.num_clients:
+            print(f"[DatasetSplitter] ATTENZIONE: creati {clients_created} client su {self.num_clients} richiesti. "
+                  f"run_multiple_clients lancera' solo {clients_created} thread.")
+
+        # Verifica finale: conta solo i client che hanno effettivamente un train/ non vuoto.
+        # Sotto carico I/O intenso su Windows, alcune copie possono fallire silenziosamente
+        # lasciando client_i senza train/ (causando FileNotFoundError durante il training).
+        valid_clients = 0
+        for i in range(clients_created):
+            train_dir = os.path.join(self.output_base_dir, f"client_{i}", "train")
+            if os.path.isdir(train_dir) and any(
+                os.path.isdir(os.path.join(train_dir, c)) for c in os.listdir(train_dir)
+            ):
+                valid_clients += 1
+            else:
+                print(f"[DatasetSplitter] WARNING: client_{i}/train mancante o vuoto — escluso dalla run.")
+        if valid_clients < clients_created:
+            print(f"[DatasetSplitter] Client validi dopo verifica I/O: {valid_clients}/{clients_created}.")
+        return valid_clients

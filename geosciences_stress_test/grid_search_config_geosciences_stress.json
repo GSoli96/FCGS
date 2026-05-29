@@ -1,0 +1,56 @@
+{
+  "ip_address": "127.0.0.1",
+  "port": 5001,
+  "hf_repo_id": "Siando/fcgs-datasets",
+  "telegram_bot_token": "8779083388:AAE9m7dlXSm2ql1kYsqcwcNy34pNYUSYFuo",
+  "telegram_chat_id": "139781098",
+  "notification_interval": 1,
+  "heartbeat_interval_hours": 1,
+  "gpu_blacklist": [1],
+  "num_parallel_executions": 1,
+  "base_csv_path": "csv",
+  "base_log_path": "log",
+  "heavy_client_threshold": 8,
+  "base_plot_path": "static/plots",
+  "base_split_data_path": "run_dataset",
+  "round_timeout": 1800,
+  "server_startup_timeout": 600,
+  "server_ready_timeout": 180,
+  "server_join_timeout": 300,
+  "early_stop_patience": 5,
+  "weighted_aggregation": true,
+  "datasets": [
+    {
+      "name": "dataset_slices_sorted",
+      "path": "dataset/dataset_slices_sorted",
+      "num_classes": 2,
+      "num_images": 4191
+    },
+    {
+      "name": "dataset_slices_sorted_Flair",
+      "path": "dataset/dataset_slices_sorted_Flair",
+      "num_classes": 2,
+      "num_images": 1452
+    }
+  ],
+  "common_search_space": {
+    "global_epoch": [5],
+    "local_epoch": [2],
+    "num_clients": [32],
+    "models_percentage": [1.0],
+    "batch_size": [16],
+    "learning_rate": [0.001],
+    "aggregation_algorithm": ["FedAvg"],
+    "encryption_mode": ["no_encryption"],
+    "he_backend": ["N/A"],
+    "fedprox_mu": [0.0]
+  },
+  "model_specific_search_space": {
+    "AlexNet": {
+      "image_size": [128],
+      "num_custom_layers": [-1],
+      "convnet_hidden1": [0],
+      "convnet_hidden2": [0]
+    }
+  }
+}

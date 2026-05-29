@@ -9,7 +9,7 @@ import json
 from typing import Dict, List, Set, Any
 import threading
 from threading import Lock, Thread
-from flask import Flask, request, render_template
+from flask import Flask, request, render_template, jsonify
 from flask_socketio import SocketIO, emit
 
 from utils import object_to_pickle_string, pickle_string_to_object, sum_encrypted_weights, \
@@ -65,11 +65,34 @@ class FederatedServer:
         self.client_stats_buffer: List[Dict] = []
         self.static_calibration_term: np.ndarray = None
         self.ckks_public_context_bytes: bytes = None
+        self._ckks_key_data: dict = None
 
         # --- Encryption ---
         self.encryption_mode: str = self.config.get('encryption_mode', 'none')
         if self.encryption_mode != 'no_encryption':
-            self.logger.info("Encryption mode enabled: %s. The server will operate key-agnostic.", self.encryption_mode)
+            he_backend = self.config.get('he_backend', 'ckks')
+            if he_backend == 'ckks':
+                self.logger.info("Generating TenSEAL CKKS context (poly_modulus_degree=8192)...")
+                import tenseal as ts
+                context = ts.context(
+                    ts.SCHEME_TYPE.CKKS,
+                    poly_modulus_degree=8192,
+                    coeff_mod_bit_sizes=[60, 40, 40, 60]
+                )
+                context.generate_galois_keys()
+                context.global_scale = 2 ** 40
+                full_bytes = context.serialize(save_secret_key=True)
+                context.make_context_public()
+                pub_bytes = context.serialize(save_secret_key=False)
+                self.ckks_public_context_bytes = pub_bytes
+                self._ckks_key_data = {
+                    'backend': 'ckks',
+                    'full_context': codecs.encode(full_bytes, 'base64').decode(),
+                    'public_context': codecs.encode(pub_bytes, 'base64').decode(),
+                }
+                self.logger.info("CKKS context generated successfully.")
+            else:
+                self.logger.info("Encryption mode enabled: %s. The server will operate key-agnostic.", self.encryption_mode)
 
         # --- Flask & SocketIO Setup ---
         _root = os.path.dirname(os.path.abspath(__file__))
@@ -117,21 +140,30 @@ class FederatedServer:
         self.socketio.run(self.app, host=self.config['ip_address'], port=self.config['port'])
 
     def _watchdog_loop(self) -> None:
+        startup_timeout = int(self.config.get('server_startup_timeout', 180))
+        startup_deadline = time.time() + startup_timeout
         while not self.is_training_finished:
             time.sleep(30)
             if self.is_training_finished:
                 break
-            if self.round_phase != 'idle' and time.time() - self._last_activity > self._round_timeout:
-                self.logger.error(
-                    "Watchdog: no activity for %ds in round %d (%s phase). Forcing shutdown.",
-                    self._round_timeout, self.current_round, self.round_phase
-                )
-                self._shutdown_server()
-                break
+            if self.current_round == -1:
+                if time.time() > startup_deadline:
+                    self.logger.error("Watchdog: Startup timeout. Not all clients connected within %ds. Forcing shutdown.", startup_timeout)
+                    self._shutdown_server()
+                    break
+            else:
+                if self.round_phase != 'idle' and time.time() - self._last_activity > self._round_timeout:
+                    self.logger.error(
+                        "Watchdog: no activity for %ds in round %d (%s phase). Forcing shutdown.",
+                        self._round_timeout, self.current_round, self.round_phase
+                    )
+                    self._shutdown_server()
+                    break
 
     def _register_routes_and_handlers(self) -> None:
         """Registers Flask routes and SocketIO event handlers."""
         self.app.route('/')(self._status_page)
+        self.app.route('/keys')(self._serve_keys)
 
         self.socketio.on('connect')(self._on_connect)
         self.socketio.on('disconnect')(self._on_disconnect)
@@ -297,6 +329,14 @@ class FederatedServer:
                     ctypes.c_ulong(thread_ident),
                     ctypes.py_object(SystemExit)
                 )
+                # Wake up the server network event loop by making a quick local HTTP request
+                # to unlock any blocking C-level select() or recv() call.
+                try:
+                    import requests
+                    url = f"http://{self.config['ip_address']}:{self.config['port']}/"
+                    requests.get(url, timeout=2)
+                except Exception:
+                    pass
         Thread(target=_do_stop, daemon=True).start()
 
     # --- SocketIO Event Handlers ---
@@ -332,11 +372,15 @@ class FederatedServer:
     def _on_reconnect(self):
         self.logger.info("Client reconnected: %s", request.sid)
 
+    def _serve_keys(self):
+        if self._ckks_key_data:
+            return jsonify(self._ckks_key_data)
+        return jsonify({'backend': 'none'})
+
     def _on_client_wake_up(self):
         self.logger.info("Client %s is waking up. Sending init signal with TA address.", request.sid)
-        # Invece di 'init', inviamo l'indirizzo della TA.
-        ta_address = f"http://{self.config['ip_address']}:{self.config['ta_port']}"
-        emit('init', {'ta_address': ta_address})
+        server_url = f"http://{self.config['ip_address']}:{self.config['port']}"
+        emit('init', {'ta_address': server_url})
 
         # federated_server.py
 

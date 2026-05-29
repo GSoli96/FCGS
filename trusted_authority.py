@@ -5,7 +5,7 @@ import pickle
 import threading
 import time
 from threading import Thread
-from flask import Flask, request
+from flask import Flask, request, jsonify
 from flask_socketio import SocketIO, emit
 from phe import paillier
 from utils import object_to_pickle_string
@@ -24,7 +24,7 @@ class TrustedAuthority:
         self.port = port
         self.he_backend = he_backend
         self.app = Flask(__name__)
-        self.socketio = SocketIO(self.app)
+        self.socketio = SocketIO(self.app, max_http_buffer_size=int(1e8), ping_timeout=3600, ping_interval=25)
         self.logger = self._setup_logger()
 
         if he_backend == 'ckks':
@@ -76,10 +76,26 @@ class TrustedAuthority:
 
     def _register_handlers(self) -> None:
         """Registers SocketIO event handlers."""
+        self.app.route('/')(lambda: ("TA OK", 200))
+        self.app.route('/keys')(self._http_get_keys)
         self.socketio.on('connect')(self._on_connect)
         self.socketio.on('disconnect')(self._on_disconnect)
         self.socketio.on('request_keys')(self._on_request_keys)
         self.socketio.on('shutdown_ta')(self._on_shutdown_ta)
+
+    def _http_get_keys(self):
+        """HTTP endpoint to download keys — avoids WebSocket size limits."""
+        if self.he_backend in ('ckks', 'bfv'):
+            return jsonify({
+                'backend': self.he_backend,
+                'full_context': codecs.encode(self.ckks_full_context_bytes, 'base64').decode(),
+                'public_context': codecs.encode(self.ckks_public_context_bytes, 'base64').decode(),
+            })
+        return jsonify({
+            'backend': 'paillier',
+            'pubkey': self.pickled_pubkey,
+            'privkey': self.pickled_privkey,
+        })
 
     def run(self) -> None:
         """Starts the Flask-SocketIO server for the TA."""

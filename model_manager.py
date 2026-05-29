@@ -246,7 +246,12 @@ class ModelManager:
         trainable_params = self._get_trainable_parameters()
         optimizer = torch.optim.Adam(trainable_params, lr=lr)
         scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', patience=3, factor=0.1)
-        train_loader = self._get_dataloader('train', batch_size)
+        try:
+            train_loader = self._get_dataloader('train', batch_size)
+        except FileNotFoundError as e:
+            import logging as _log
+            _log.getLogger(__name__).error("train() aborted: %s", e)
+            return 0.0, {'f1_score': 0, 'accuracy': 0, 'precision': 0, 'recall': 0}, 0.0, 0
 
         global_params_tensor = None
         if algorithm == 'FedProx' and global_weights is not None:
@@ -263,29 +268,45 @@ class ModelManager:
 
     def _run_training_epoch(self, loader: DataLoader, optimizer: torch.optim.Optimizer,
                             algorithm: str, global_params: List[torch.Tensor], mu: float) -> float:
+        """Train for one epoch. Uses safe iteration to skip batches with missing files."""
+        import logging as _log
         self.model.train()
         running_loss = 0.0
-        for inputs, labels in loader:
-            inputs, labels = inputs.to(self.device), labels.to(self.device)
-            optimizer.zero_grad()
-            outputs = self.model(inputs)
+        processed = 0
+        # Use explicit iterator so we can catch errors from __next__ (file not found during load)
+        loader_iter = iter(loader)
+        while True:
+            try:
+                inputs, labels = next(loader_iter)
+            except StopIteration:
+                break
+            except (FileNotFoundError, OSError) as _file_err:
+                _log.getLogger(__name__).warning("Skipping batch (file missing during load): %s", _file_err)
+                continue
+            try:
+                inputs, labels = inputs.to(self.device), labels.to(self.device)
+                optimizer.zero_grad()
+                outputs = self.model(inputs)
 
-            if algorithm == 'FedLC':
-                loss = self.criterion(outputs - self.calibration_term.unsqueeze(0), labels)
-            else:
-                loss = self.criterion(outputs, labels)
+                if algorithm == 'FedLC':
+                    loss = self.criterion(outputs - self.calibration_term.unsqueeze(0), labels)
+                else:
+                    loss = self.criterion(outputs, labels)
 
-            if algorithm == 'FedProx' and mu > 0 and global_params:
-                prox_term = 0.0
-                local_params = self._get_trainable_parameters()
-                for local_w, global_w in zip(local_params, global_params):
-                    prox_term += (local_w - global_w).norm(2)
-                loss += (mu / 2) * prox_term
+                if algorithm == 'FedProx' and mu > 0 and global_params:
+                    prox_term = 0.0
+                    local_params = self._get_trainable_parameters()
+                    for local_w, global_w in zip(local_params, global_params):
+                        prox_term += (local_w - global_w).norm(2)
+                    loss += (mu / 2) * prox_term
 
-            loss.backward()
-            optimizer.step()
-            running_loss += loss.item() * inputs.size(0)
-        return running_loss / len(loader.dataset)
+                loss.backward()
+                optimizer.step()
+                running_loss += loss.item() * inputs.size(0)
+                processed += inputs.size(0)
+            except (FileNotFoundError, OSError) as _file_err:
+                _log.getLogger(__name__).warning("Skipping batch (I/O error during forward): %s", _file_err)
+        return running_loss / max(processed, 1)
 
     def validate(self, batch_size: int, split: str = 'valid') -> Tuple[float, Dict, float, int]:
         try:
@@ -298,18 +319,32 @@ class ModelManager:
         running_loss = 0.0
 
         algorithm = self.config.get('algorithm', 'FedAvg')
+        import logging as _log
         with torch.no_grad():
-            for images, labels in data_loader:
-                images, labels = images.to(self.device), labels.to(self.device)
-                outputs = self.model(images)
-                if algorithm == 'FedLC':
-                    loss = self.criterion(outputs - self.calibration_term.unsqueeze(0), labels)
-                else:
-                    loss = self.criterion(outputs, labels)
-                running_loss += loss.item() * images.size(0)
-                _, preds = torch.max(outputs, 1)
-                all_preds.extend(preds.cpu().numpy())
-                all_labels.extend(labels.cpu().numpy())
+            loader_iter = iter(data_loader)
+            while True:
+                try:
+                    images, labels = next(loader_iter)
+                except StopIteration:
+                    break
+                except (FileNotFoundError, OSError) as _file_err:
+                    _log.getLogger(__name__).warning(
+                        "Skipping batch in validate(%s) — file missing: %s", split, _file_err)
+                    continue
+                try:
+                    images, labels = images.to(self.device), labels.to(self.device)
+                    outputs = self.model(images)
+                    if algorithm == 'FedLC':
+                        loss = self.criterion(outputs - self.calibration_term.unsqueeze(0), labels)
+                    else:
+                        loss = self.criterion(outputs, labels)
+                    running_loss += loss.item() * images.size(0)
+                    _, preds = torch.max(outputs, 1)
+                    all_preds.extend(preds.cpu().numpy())
+                    all_labels.extend(labels.cpu().numpy())
+                except (FileNotFoundError, OSError) as _file_err:
+                    _log.getLogger(__name__).warning(
+                        "Skipping batch in validate(%s) — I/O error: %s", split, _file_err)
 
         val_loss = running_loss / len(data_loader.dataset)
         metrics = {

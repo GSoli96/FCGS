@@ -7,7 +7,7 @@
   "notification_interval": 100,
   "heartbeat_interval_hours": 4,
   "gpu_blacklist": [],
-  "num_parallel_executions": 3,
+  "num_parallel_executions": 4,
   "base_csv_path": "csv",
   "base_log_path": "log",
   "heavy_client_threshold": 8,
@@ -177,7 +177,8 @@
     "num_clients": [
       2,
       4,
-      8
+      8,
+      16
     ],
     "models_percentage": [
       1
@@ -230,6 +231,16 @@
       ]
     },
     "ResNet34": {
+      "image_size": [
+        128,
+        224
+      ],
+      "num_custom_layers": [
+        2,
+        4
+      ]
+    },
+    "ResNet50": {
       "image_size": [
         128,
         224

@@ -60,7 +60,8 @@ class FederatedClient:
 
         self.sio = socketio.Client(logger=False, engineio_logger=False, request_timeout=10, reconnection=False)
         self._register_event_handlers()
-        self.connect_to_server()
+        # connect_to_server() is called explicitly by run_multiple_clients
+        # so that the caller holds a reference to this instance before blocking.
 
     def _setup_logger(self) -> logging.LoggerAdapter:
         worker_id = self.config.get('worker_id', 'N/A')
@@ -316,4 +317,10 @@ class FederatedClient:
             'test_recall': metric_score['recall'], 'test_size': test_size,
         }
         self.logger.info("Sending final evaluation to the server.")
-        self.sio.emit('client_eval', response)
+        if self.sio.connected:
+            try:
+                self.sio.emit('client_eval', response)
+            except Exception as e:
+                self.logger.warning("Could not send client_eval (socket disconnected): %s", e)
+        else:
+            self.logger.warning("Socket disconnected before sending client_eval. Skipping.")

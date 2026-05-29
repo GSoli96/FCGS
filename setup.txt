@@ -1,0 +1,68 @@
+Windows (MSIDomino11, MSIDomino12, MSI)
+
+  :: 1. Crea il venv
+  python -m venv venv
+
+  :: 2. Attiva il venv
+  venv\Scripts\activate
+
+  :: 3. Aggiorna pip
+  python -m pip install --upgrade pip
+
+  :: 4. Installa i requirements
+  pip install -r requirements_windows.txt
+
+  :: 5. Installa PyTorch con CUDA (separato)
+  pip install torch torchvision --index-url https://download.pytorch.org/whl/cu126
+
+  :: 6. Verifica
+  python -c "import torch; print(torch.cuda.is_available())"
+
+  ---
+  Linux (geosciences)
+
+  # 1. Crea il venv
+  python3 -m venv venv
+
+  # 2. Attiva il venv
+  source venv/bin/activate
+
+  # 3. Aggiorna pip
+  pip install --upgrade pip
+
+  # 4. Installa i requirements
+  pip install -r requirements_linux.txt
+
+  # 5. Installa PyTorch con CUDA (separato, adatta cu126 alla versione CUDA della macchina)
+  pip install torch torchvision --index-url https://download.pytorch.org/whl/cu126
+
+  # 6. Verifica
+  python -c "import torch; print(torch.cuda.is_available())"
+
+
+   ---
+  Note importanti
+
+  CUDA version: su geosciences hai CUDA 13.0 — verifica che cu126 sia compatibile. Se torch.cuda.is_available() restituisce False, prova con cu124 o cu128.
+
+  TenSEAL: richiede Python ≤ 3.11. Se hai 3.12+ l'installazione fallisce. Controlla con python --version prima di procedere.
+
+  Avvio (uguale su tutti):
+  # Attiva il venv se non è già attivo, poi:
+  python federated_grid_search.py
+
+  --
+  Claude
+ avvia il codice python federated_grid_search.py, e controlla che tutto vada per il meglio, ho installato gia tutto, controlla ogni ora che tutto si salvi correttamente, e controlla che le porte non rimangano occupate da processi morti, o controlla che il server o i client non abbiano problemi.  quando fai operazioni di modifica che riavvii sempre i processi, controlla sempre che non ci siano processi precedenti ancora attivi. ricordati, di mandarmi  ogni 4 ore un messaggio telegram con scritto "pc da cui arriva il messaggio, percentuale o numero di esecuzioni fatte/ sul totale, errori avuto, fail, tempo trascorso"
+
+"PowerShell(New-Item *)",
+"Bash(*)",
+"Edit(*)",
+"Write(*)",
+"Read(*)",
+"PowerShell(*)",
+"Glob(*)",
+"Grep(*)",
+
+Claude, leggi tasks.md. Prendi in carico i problemi uno alla volta, lancia i fix, esegui i test per verificare che funzionino e segna il task come completato nel file. Continua a oltranza finché non hai svuotato la lista
+

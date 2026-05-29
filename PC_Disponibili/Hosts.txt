@@ -1,0 +1,14 @@
+Host msi
+    HostName 100.123.78.19
+    User giand
+    Path Progetto: /C:/Users/giand/Desktop/prog/FCGS
+
+Host domino11
+    HostName 100.88.184.11
+    User domin
+    Path Progetto: /C:/Users/domin/Desktop/prog/FCGS
+
+Host domino12
+    HostName 100.88.71.118
+    User dastl
+    Path Progetto: /C:/Users/dastl/Desktop/Giando/FCGS

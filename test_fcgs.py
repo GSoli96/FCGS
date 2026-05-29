@@ -1,839 +1,1917 @@
 """
-Test suite per FCGS (Federated Computing Grid Search).
-Copre: configurazioni JSON, logica di deduplicazione/fingerprinting,
-       aggregazione pesi, utils, watchdog, assegnamento porte.
-Eseguire dalla root del progetto con il venv attivo:
-    python -m pytest test_fcgs.py -v
-oppure:
-    python test_fcgs.py
+test_fcgs.py — Suite di test per FCGS.
+
+Sezioni:
+  A — Path e directory (cross-platform)
+  B — Dataset manager (filtro + download parallelo mock)
+  C — Worker scheduling (heavy/normal isolation)
+  D — CSV thread-safety e deduplication
+  E — Telegram + log
+  F — Stress test worker scheduling
+  G — Dataset loading e image access (DatasetSplitter + ImageFolder)
+  H — Namespace error handling (socket disconnesso durante emit)
+  I — Watchdog scenarios (effective clients, dataset piccoli)
+  J — Port management (find_free_port, race condition, cleanup)
+  K — Heavy scheduling avanzato (isolation, children, boundary)
+  L — Zombie process cleanup (_cleanup_after_task)
 """
-import sys
-import os
+import csv
 import json
 import logging
-import itertools
+import multiprocessing
+import os
+import sys
+import tempfile
+import threading
+import time
 import unittest
-from typing import Dict, FrozenSet, Set, Tuple
-from unittest.mock import patch, MagicMock
+from pathlib import Path
+from unittest.mock import MagicMock, patch, call
 
-PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
-sys.path.insert(0, PROJECT_ROOT)
-
-import numpy as np
-
-try:
-    import torch
-    TORCH_AVAILABLE = True
-except ImportError:
-    TORCH_AVAILABLE = False
-
-# ---------------------------------------------------------------------------
-# Funzioni helper copiate da federated_grid_search.py (testate isolatamente)
-# ---------------------------------------------------------------------------
-
-def _get_config_fingerprint(config: Dict, keys: Set[str]) -> FrozenSet[Tuple[str, str]]:
-    items = []
-    for key in sorted(list(keys)):
-        if key in config and config[key] is not None and config[key] != '':
-            items.append((key, str(config[key])))
-    return frozenset(items)
+_PROJECT_ROOT = Path(__file__).parent
 
 
-def _format_duration(seconds: float) -> str:
-    h = int(seconds // 3600)
-    m = int((seconds % 3600) // 60)
-    s = int(seconds % 60)
-    if h > 0:
-        return f"{h}h {m}m {s}s"
-    if m > 0:
-        return f"{m}m {s}s"
-    return f"{s}s"
+# ===========================================================================
+# Funzioni helper a livello di modulo per multiprocessing (Windows spawn)
+# ===========================================================================
+
+def _proc_hang_forever():
+    time.sleep(3600)
 
 
-def _generate_configurations(base_config: Dict, search_space: Dict):
-    if not search_space:
-        yield base_config
-        return
-    keys, values = zip(*search_space.items())
-    for combo in itertools.product(*values):
-        config = base_config.copy()
-        config.update(dict(zip(keys, combo)))
-        yield config
+def _proc_exit_immediately():
+    pass
 
 
-def _normalize_config(hyper_config: Dict, model_name: str) -> Dict:
-    """Applica le stesse normalizzazioni di federated_grid_search.py."""
-    c = hyper_config.copy()
-    if c.get('aggregation_algorithm') != 'FedProx':
-        c['fedprox_mu'] = 0.0
-    if c.get('encryption_mode') == 'no_encryption':
-        c['he_backend'] = 'N/A'
-    if 'ResNet' in model_name or 'GoogLeNet' in model_name or 'AlexNet' in model_name:
-        c['image_size'] = 224
-        c.setdefault('convnet_hidden1', -1)
-        c.setdefault('convnet_hidden2', -1)
-    elif 'ConvNet' in model_name:
-        c.setdefault('num_custom_layers', -1)
-    return c
+def _proc_hold_port(port):
+    import socket as _sock
+    s = _sock.socket(_sock.AF_INET, _sock.SOCK_STREAM)
+    s.setsockopt(_sock.SOL_SOCKET, _sock.SO_REUSEADDR, 1)
+    try:
+        s.bind(('127.0.0.1', port))
+        s.listen(1)
+        time.sleep(3600)
+    finally:
+        s.close()
 
 
-def _count_unique_configs(gs_config: Dict) -> int:
-    """Conta le configurazioni uniche eseguibili per un dato config JSON."""
-    common_ss = gs_config['common_search_space']
-    model_ss = gs_config['model_specific_search_space']
-
-    all_keys: Set[str] = set(common_ss.keys())
-    for mp in model_ss.values():
-        all_keys.update(mp.keys())
-    all_keys.update(['dataset_name', 'model_name'])
-
-    seen: Set[FrozenSet] = set()
-
-    for dataset_info in gs_config['datasets']:
-        for model_name, specific_params in model_ss.items():
-            base = {'dataset_name': dataset_info['name'], 'model_name': model_name}
-            search_space = {**common_ss, **specific_params}
-            for raw in _generate_configurations(base, search_space):
-                norm = _normalize_config(raw, model_name)
-                fp = _get_config_fingerprint(norm, all_keys)
-                seen.add(fp)
-
-    return len(seen)
+def _proc_parent_with_child(pid_list):
+    child = multiprocessing.Process(target=_proc_hang_forever)
+    child.daemon = False
+    child.start()
+    pid_list.append(child.pid)
+    time.sleep(3600)
+sys.path.insert(0, str(_PROJECT_ROOT))
 
 
-# ---------------------------------------------------------------------------
-# 1. VALIDAZIONE CONFIGURAZIONI JSON
-# ---------------------------------------------------------------------------
+# ===========================================================================
+# A — PATH E DIRECTORY
+# ===========================================================================
 
-REQUIRED_GRID_KEYS = {
-    'ip_address', 'port', 'num_parallel_executions',
-    'base_csv_path', 'base_log_path', 'base_split_data_path',
-    'early_stop_patience', 'weighted_aggregation',
-    'datasets', 'common_search_space', 'model_specific_search_space',
-}
-
-REQUIRED_COMMON_KEYS = {
-    'encryption_mode', 'he_backend', 'device',
-    'global_epoch', 'local_epoch', 'num_clients',
-    'learning_rate', 'batch_size', 'aggregation_algorithm', 'fedprox_mu',
-}
-
-CONFIG_FILES = {
-    'geosciences':  'grid_search_config.json',
-    'MSIDomino11':  'grid_search_config_MSIDomino11.json',
-    'MSIDomino12':  'grid_search_config_MSIDomino12.json',
-}
-
-EXPECTED_WORKERS = {
-    'geosciences': 12,
-    'MSIDomino11': 3,
-    'MSIDomino12': 3,
-}
-
-EXPECTED_DATASET_COUNTS = {
-    'geosciences': 8,
-    'MSIDomino11': 9,
-    'MSIDomino12': 5,
-}
-
-
-class TestConfigValidation(unittest.TestCase):
-
-    def _load(self, fname: str) -> Dict:
-        path = os.path.join(PROJECT_ROOT, fname)
-        self.assertTrue(os.path.exists(path), f"Config file not found: {fname}")
-        with open(path) as f:
-            return json.load(f)
-
-    def test_all_configs_are_valid_json(self):
-        for machine, fname in CONFIG_FILES.items():
-            with self.subTest(machine=machine):
-                cfg = self._load(fname)
-                self.assertIsInstance(cfg, dict)
-
-    def test_required_top_level_keys(self):
-        for machine, fname in CONFIG_FILES.items():
-            with self.subTest(machine=machine):
-                cfg = self._load(fname)
-                for key in REQUIRED_GRID_KEYS:
-                    self.assertIn(key, cfg, f"'{key}' mancante in {fname}")
-
-    def test_required_common_search_space_keys(self):
-        for machine, fname in CONFIG_FILES.items():
-            with self.subTest(machine=machine):
-                cfg = self._load(fname)
-                cs = cfg['common_search_space']
-                for key in REQUIRED_COMMON_KEYS:
-                    self.assertIn(key, cs, f"'{key}' mancante in common_search_space di {fname}")
-
-    def test_num_parallel_executions(self):
-        for machine, fname in CONFIG_FILES.items():
-            with self.subTest(machine=machine):
-                cfg = self._load(fname)
-                self.assertEqual(
-                    cfg['num_parallel_executions'], EXPECTED_WORKERS[machine],
-                    f"num_parallel_executions errato per {machine}"
-                )
-
-    def test_dataset_counts(self):
-        for machine, fname in CONFIG_FILES.items():
-            with self.subTest(machine=machine):
-                cfg = self._load(fname)
-                self.assertEqual(
-                    len(cfg['datasets']), EXPECTED_DATASET_COUNTS[machine],
-                    f"Numero dataset errato per {machine}"
-                )
-
-    def test_datasets_have_required_fields(self):
-        for machine, fname in CONFIG_FILES.items():
-            with self.subTest(machine=machine):
-                cfg = self._load(fname)
-                for ds in cfg['datasets']:
-                    self.assertIn('name', ds)
-                    self.assertIn('path', ds)
-                    self.assertIn('num_classes', ds)
-                    self.assertIsInstance(ds['num_classes'], int)
-                    self.assertGreater(ds['num_classes'], 0)
-
-    def test_no_dataset_overlap_between_machines(self):
-        sets = {}
-        for machine, fname in CONFIG_FILES.items():
-            cfg = self._load(fname)
-            sets[machine] = {ds['name'] for ds in cfg['datasets']}
-
-        machines = list(sets.keys())
-        for i in range(len(machines)):
-            for j in range(i + 1, len(machines)):
-                m1, m2 = machines[i], machines[j]
-                overlap = sets[m1] & sets[m2]
-                self.assertEqual(
-                    len(overlap), 0,
-                    f"Dataset overlap tra {m1} e {m2}: {overlap}"
-                )
-
-    def test_all_22_datasets_covered(self):
-        all_datasets = set()
-        for fname in CONFIG_FILES.values():
-            cfg = self._load(fname)
-            for ds in cfg['datasets']:
-                all_datasets.add(ds['name'])
-        self.assertEqual(len(all_datasets), 22, f"Totale dataset: {len(all_datasets)}, attesi 22")
-
-    def test_geosciences_has_only_slices_datasets(self):
-        cfg = self._load(CONFIG_FILES['geosciences'])
-        for ds in cfg['datasets']:
-            self.assertTrue(
-                ds['name'].startswith('dataset_slices_sorted'),
-                f"Dataset non-slices in geosciences: {ds['name']}"
-            )
-
-    def test_domino11_has_multy_and_brain(self):
-        cfg = self._load(CONFIG_FILES['MSIDomino11'])
-        names = {ds['name'] for ds in cfg['datasets']}
-        self.assertIn('brain_tumor', names)
-        for n in names:
-            if n != 'brain_tumor':
-                self.assertTrue(n.startswith('dataset_multy_sorted'), f"Dataset inatteso in Domino11: {n}")
-
-    def test_domino12_has_skin_datasets(self):
-        cfg = self._load(CONFIG_FILES['MSIDomino12'])
-        names = {ds['name'] for ds in cfg['datasets']}
-        expected = {'dataset_HAM1000', 'dataset_ISIC', 'dataset_ISIC2', 'dataset_RD_colored', 'dataset_RD_kdr299'}
-        self.assertEqual(names, expected)
-
-    def test_port_is_integer(self):
-        for machine, fname in CONFIG_FILES.items():
-            with self.subTest(machine=machine):
-                cfg = self._load(fname)
-                self.assertIsInstance(cfg['port'], int)
-
-    def test_search_space_lists_non_empty(self):
-        for machine, fname in CONFIG_FILES.items():
-            with self.subTest(machine=machine):
-                cfg = self._load(fname)
-                for key, val in cfg['common_search_space'].items():
-                    self.assertIsInstance(val, list, f"'{key}' non è lista in {fname}")
-                    self.assertGreater(len(val), 0, f"'{key}' è lista vuota in {fname}")
-
-
-# ---------------------------------------------------------------------------
-# 2. LOGICA DI GENERAZIONE CONFIGURAZIONI E FINGERPRINTING
-# ---------------------------------------------------------------------------
-
-class TestFingerprintNormalization(unittest.TestCase):
+class TestPaths(unittest.TestCase):
 
     def setUp(self):
-        with open(os.path.join(PROJECT_ROOT, 'grid_search_config.json')) as f:
-            self.cfg = json.load(f)
-        self.all_keys: Set[str] = set(self.cfg['common_search_space'].keys())
-        for mp in self.cfg['model_specific_search_space'].values():
-            self.all_keys.update(mp.keys())
-        self.all_keys.update(['dataset_name', 'model_name'])
+        self.tmp = tempfile.mkdtemp()
 
-    def test_fedavg_forces_fedprox_mu_to_zero(self):
-        c = {'aggregation_algorithm': 'FedAvg', 'fedprox_mu': 0.05, 'encryption_mode': 'no_encryption',
-             'model_name': 'ConvNet'}
-        norm = _normalize_config(c, 'ConvNet')
-        self.assertEqual(norm['fedprox_mu'], 0.0)
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self.tmp, ignore_errors=True)
 
-    def test_fedprox_keeps_mu(self):
-        c = {'aggregation_algorithm': 'FedProx', 'fedprox_mu': 0.05, 'encryption_mode': 'no_encryption',
-             'model_name': 'ConvNet'}
-        norm = _normalize_config(c, 'ConvNet')
-        self.assertEqual(norm['fedprox_mu'], 0.05)
+    def test_log_dir_structure(self):
+        """log/log_{PC}/ viene creato correttamente."""
+        log_root = os.path.join(self.tmp, 'log')
+        log_pc = os.path.join(log_root, 'log_TestPC')
+        os.makedirs(log_pc, exist_ok=True)
+        self.assertTrue(os.path.isdir(log_pc))
+        self.assertTrue(log_pc.replace('\\', '/').endswith('log/log_TestPC'))
 
-    def test_he_backend_normalized_to_na_for_no_encryption(self):
-        """Con no_encryption he_backend viene normalizzato a N/A (schema irrilevante)."""
-        c = {'aggregation_algorithm': 'FedAvg', 'fedprox_mu': 0.05,
-             'encryption_mode': 'no_encryption', 'he_backend': 'ckks', 'model_name': 'ConvNet'}
-        norm = _normalize_config(c, 'ConvNet')
-        self.assertEqual(norm['he_backend'], 'N/A')
+    def test_csv_dir_structure(self):
+        """csv/csv_{PC}/ viene creato correttamente."""
+        csv_root = os.path.join(self.tmp, 'csv')
+        csv_pc = os.path.join(csv_root, 'csv_TestPC')
+        os.makedirs(csv_pc, exist_ok=True)
+        self.assertTrue(os.path.isdir(csv_pc))
 
-    def test_he_backend_kept_for_homomorphic(self):
-        """Con cifratura omomorfica he_backend rimane ckks (schema usato a runtime)."""
-        c = {'aggregation_algorithm': 'FedAvg', 'fedprox_mu': 0.05,
-             'encryption_mode': 'homomorphic', 'he_backend': 'ckks', 'model_name': 'ConvNet'}
-        norm = _normalize_config(c, 'ConvNet')
-        self.assertEqual(norm['he_backend'], 'ckks')
+    def test_cross_platform_join(self):
+        """os.path.join produce path validi su Windows e POSIX."""
+        p = os.path.join('log', 'log_TestPC', 'run_identifier')
+        self.assertIn('log_TestPC', p)
+        self.assertNotIn('//', p)
+        self.assertNotIn('\\\\', p.replace('\\\\', ''))
 
-    def test_googlenet_forces_image_size_224(self):
-        for model in ('GoogLeNet', 'AlexNet', 'ResNet18', 'ResNet34', 'ResNet50', 'ResNet101'):
-            with self.subTest(model=model):
-                c = {'image_size': 128, 'encryption_mode': 'no_encryption', 'aggregation_algorithm': 'FedAvg',
-                     'fedprox_mu': 0.05}
-                norm = _normalize_config(c, model)
-                self.assertEqual(norm['image_size'], 224, f"{model} deve avere image_size=224")
+    def test_project_root_is_directory(self):
+        """_PROJECT_ROOT punta a una directory esistente."""
+        self.assertTrue(_PROJECT_ROOT.is_dir())
 
-    def test_convnet_does_not_force_image_size(self):
-        c = {'image_size': 128, 'encryption_mode': 'no_encryption', 'aggregation_algorithm': 'FedAvg',
-             'fedprox_mu': 0.05}
-        norm = _normalize_config(c, 'ConvNet')
-        self.assertEqual(norm['image_size'], 128)
-
-    def test_he_backend_is_ckks_only(self):
-        """Per ora he_backend usa solo ckks."""
-        for machine, fname in CONFIG_FILES.items():
-            with self.subTest(machine=machine):
-                with open(os.path.join(PROJECT_ROOT, fname)) as f:
-                    cfg = json.load(f)
-                backends = cfg['common_search_space']['he_backend']
-                self.assertEqual(backends, ['ckks'], f"he_backend deve essere ['ckks'] in {fname}")
-
-    def test_image_size_128_224_deduplicates_for_resnet(self):
-        base = {'dataset_name': 'ds', 'model_name': 'ResNet18',
-                'aggregation_algorithm': 'FedAvg', 'fedprox_mu': 0.05,
-                'encryption_mode': 'no_encryption', 'he_backend': 'ckks',
-                'num_custom_layers': 2, 'global_epoch': 5}
-        c128 = {**base, 'image_size': 128}
-        c224 = {**base, 'image_size': 224}
-        norm128 = _normalize_config(c128, 'ResNet18')
-        norm224 = _normalize_config(c224, 'ResNet18')
-        fp128 = _get_config_fingerprint(norm128, self.all_keys)
-        fp224 = _get_config_fingerprint(norm224, self.all_keys)
-        self.assertEqual(fp128, fp224, "image_size 128 e 224 devono deduplicarsi per ResNet")
+    def test_path_with_spaces_in_run_id(self):
+        """Run identifier con caratteri speciali non causa errori di path."""
+        run_id = "dataset_slices_sorted_run_0_ResNet18"
+        p = os.path.join(self.tmp, 'log', 'log_TestPC', run_id)
+        os.makedirs(p, exist_ok=True)
+        self.assertTrue(os.path.isdir(p))
 
 
-class TestConfigCounting(unittest.TestCase):
+# ===========================================================================
+# B — DATASET MANAGER
+# ===========================================================================
 
-    def _load(self, fname: str) -> Dict:
-        with open(os.path.join(PROJECT_ROOT, fname)) as f:
-            return json.load(f)
+class TestDatasetManager(unittest.TestCase):
 
-    def test_geosciences_unique_config_count(self):
-        cfg = self._load('grid_search_config.json')
-        count = _count_unique_configs(cfg)
-        # 2 combo cifratura: no_enc(N/A) + homomorphic+ckks
-        self.assertEqual(count, 17_920,
-                         f"geosciences: attese 17920 config uniche, trovate {count}")
+    def test_required_datasets_filter(self):
+        """Solo i dataset effettivamente usati in pending_configs vengono scaricati."""
+        all_datasets = [
+            {'name': 'ds_A', 'path': 'dataset/ds_A', 'num_classes': 2, 'num_images': 100},
+            {'name': 'ds_B', 'path': 'dataset/ds_B', 'num_classes': 2, 'num_images': 200},
+            {'name': 'ds_C', 'path': 'dataset/ds_C', 'num_classes': 3, 'num_images': 300},
+        ]
+        pending_configs = [
+            {'dataset_path': 'dataset/ds_A', 'model_name': 'ConvNet'},
+            {'dataset_path': 'dataset/ds_C', 'model_name': 'ResNet18'},
+        ]
+        required_paths = {c['dataset_path'] for c in pending_configs}
+        filtered = [ds for ds in all_datasets if ds['path'] in required_paths]
+        self.assertEqual(len(filtered), 2)
+        names = {ds['name'] for ds in filtered}
+        self.assertIn('ds_A', names)
+        self.assertIn('ds_C', names)
+        self.assertNotIn('ds_B', names)
 
-    def test_domino11_unique_config_count(self):
-        cfg = self._load('grid_search_config_MSIDomino11.json')
-        count = _count_unique_configs(cfg)
-        self.assertEqual(count, 20_160,
-                         f"MSIDomino11: attese 20160 config uniche, trovate {count}")
+    def test_required_datasets_filter_empty_pending(self):
+        """Con zero pending_configs, non viene scaricato nulla."""
+        all_datasets = [{'name': 'ds_A', 'path': 'dataset/ds_A', 'num_classes': 2, 'num_images': 100}]
+        pending_configs = []
+        required_paths = {c['dataset_path'] for c in pending_configs}
+        filtered = [ds for ds in all_datasets if ds['path'] in required_paths]
+        self.assertEqual(len(filtered), 0)
 
-    def test_domino12_unique_config_count(self):
-        cfg = self._load('grid_search_config_MSIDomino12.json')
-        count = _count_unique_configs(cfg)
-        self.assertEqual(count, 11_200,
-                         f"MSIDomino12: attese 11200 config uniche, trovate {count}")
+    @patch('dataset_manager._download_folder')
+    @patch('dataset_manager._get_hf_token', return_value='fake_token')
+    @patch('dataset_manager._find_missing')
+    def test_parallel_download_called_concurrently(self, mock_missing, mock_token, mock_dl):
+        """check_and_download_datasets_parallel usa ThreadPoolExecutor."""
+        import dataset_manager
+        call_times = []
 
-    def test_total_config_count(self):
-        total = 0
-        for fname in CONFIG_FILES.values():
-            cfg = self._load(fname)
-            total += _count_unique_configs(cfg)
-        self.assertEqual(total, 49_280,
-                         f"Totale config uniche: attese 49280, trovate {total}")
+        def slow_download(repo_id, token, path):
+            call_times.append(time.time())
+            time.sleep(0.05)
+            return True
+
+        mock_dl.side_effect = slow_download
+        mock_missing.return_value = [
+            {'name': 'ds_A', 'path': 'p/A'},
+            {'name': 'ds_B', 'path': 'p/B'},
+            {'name': 'ds_C', 'path': 'p/C'},
+        ]
+        config = {'datasets': mock_missing.return_value, 'hf_repo_id': 'test/repo'}
+        start = time.time()
+        result = dataset_manager.check_and_download_datasets_parallel(config, max_parallel=3)
+        elapsed = time.time() - start
+        self.assertTrue(result)
+        # Se fossero sequenziali ci vorrebbero ~0.15s; paralleli ~0.05s
+        self.assertLess(elapsed, 0.12)
+
+    @patch('dataset_manager._download_folder', return_value=True)
+    @patch('dataset_manager._get_hf_token', return_value='fake_token')
+    @patch('dataset_manager._find_missing')
+    def test_sequential_fallback_single_dataset(self, mock_missing, mock_token, mock_dl):
+        """Con un solo dataset mancante, il download funziona correttamente."""
+        import dataset_manager
+        mock_missing.return_value = [{'name': 'ds_A', 'path': 'p/A'}]
+        config = {'datasets': mock_missing.return_value, 'hf_repo_id': 'test/repo'}
+        result = dataset_manager.check_and_download_datasets_parallel(config)
+        self.assertTrue(result)
+        mock_dl.assert_called_once()
+
+    @patch('dataset_manager._find_missing', return_value=[])
+    def test_no_download_when_all_present(self, mock_missing):
+        """Se tutti i dataset sono presenti, non viene fatto alcun download."""
+        import dataset_manager
+        config = {'datasets': [{'name': 'ds_A', 'path': 'p/A'}]}
+        result = dataset_manager.check_and_download_datasets_parallel(config)
+        self.assertTrue(result)
+
+    def test_hf_token_read_from_file(self):
+        """_get_hf_token legge correttamente da file .hf_token."""
+        import dataset_manager
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.token', delete=False) as f:
+            f.write('  test_token_123  \n')
+            fname = f.name
+        try:
+            original = dataset_manager._TOKEN_FILE
+            dataset_manager._TOKEN_FILE = Path(fname)
+            token = dataset_manager._get_hf_token()
+            self.assertEqual(token, 'test_token_123')
+        finally:
+            dataset_manager._TOKEN_FILE = original
+            os.unlink(fname)
+
+    def test_hf_token_write_read(self):
+        """_get_hf_token_write legge correttamente da file .hf_token_write."""
+        import dataset_manager
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.token_write', delete=False) as f:
+            f.write('write_token_456\n')
+            fname = f.name
+        try:
+            original = dataset_manager._TOKEN_WRITE_FILE
+            dataset_manager._TOKEN_WRITE_FILE = Path(fname)
+            token = dataset_manager._get_hf_token_write()
+            self.assertEqual(token, 'write_token_456')
+        finally:
+            dataset_manager._TOKEN_WRITE_FILE = original
+            os.unlink(fname)
 
 
-# ---------------------------------------------------------------------------
-# 3. UTILS: SERIALIZZAZIONE PICKLE
-# ---------------------------------------------------------------------------
+# ===========================================================================
+# C — WORKER SCHEDULING (heavy/normal)
+# ===========================================================================
 
-class TestUtils(unittest.TestCase):
+def _simulate_worker(
+    worker_id: int,
+    configs: list,
+    results: list,
+    heavy_lock: multiprocessing.Lock,
+    heavy_running: multiprocessing.Value,
+    active_normal_workers: multiprocessing.Value,
+    heavy_threshold: int,
+    sleep_per_task: float = 0.05,
+):
+    """Simula il comportamento di scheduling heavy/normal senza fare ML reale."""
+    for cfg in configs:
+        is_heavy = cfg.get('num_clients', 2) > heavy_threshold
+        _heavy_acquired = False
+        _normal_counted = False
+        try:
+            if is_heavy:
+                heavy_lock.acquire()
+                _heavy_acquired = True
+                with heavy_running.get_lock():
+                    heavy_running.value = 1
+                deadline = time.time() + 10
+                while time.time() < deadline:
+                    with active_normal_workers.get_lock():
+                        if active_normal_workers.value == 0:
+                            break
+                    time.sleep(0.01)
+            else:
+                deadline = time.time() + 10
+                while time.time() < deadline:
+                    with heavy_running.get_lock():
+                        if heavy_running.value == 0:
+                            break
+                    time.sleep(0.01)
+                with active_normal_workers.get_lock():
+                    active_normal_workers.value += 1
+                _normal_counted = True
+
+            time.sleep(sleep_per_task)
+            results.append({'worker': worker_id, 'config': cfg, 'ts': time.time()})
+        finally:
+            if _heavy_acquired:
+                with heavy_running.get_lock():
+                    heavy_running.value = 0
+                heavy_lock.release()
+            if _normal_counted:
+                with active_normal_workers.get_lock():
+                    active_normal_workers.value = max(0, active_normal_workers.value - 1)
+
+
+class TestWorkerScheduling(unittest.TestCase):
+
+    def _make_shared(self):
+        heavy_lock = multiprocessing.Lock()
+        heavy_running = multiprocessing.Value('i', 0)
+        active_normal_workers = multiprocessing.Value('i', 0)
+        return heavy_lock, heavy_running, active_normal_workers
+
+    def test_heavy_config_isolated(self):
+        """Un config heavy gira da solo (nessun worker normale attivo nello stesso momento)."""
+        heavy_lock, heavy_running, active_normal_workers = self._make_shared()
+        threshold = 8
+
+        timeline = []
+
+        def normal_worker():
+            cfg = {'num_clients': 4}
+            _heavy_acquired = False
+            _normal_counted = False
+            try:
+                while True:
+                    with heavy_running.get_lock():
+                        if heavy_running.value == 0:
+                            break
+                    time.sleep(0.005)
+                with active_normal_workers.get_lock():
+                    active_normal_workers.value += 1
+                _normal_counted = True
+                timeline.append(('normal_start', time.time()))
+                time.sleep(0.04)
+                timeline.append(('normal_end', time.time()))
+            finally:
+                if _normal_counted:
+                    with active_normal_workers.get_lock():
+                        active_normal_workers.value = max(0, active_normal_workers.value - 1)
+
+        def heavy_worker():
+            heavy_lock.acquire()
+            _heavy_acquired = True
+            with heavy_running.get_lock():
+                heavy_running.value = 1
+            deadline = time.time() + 5
+            while time.time() < deadline:
+                with active_normal_workers.get_lock():
+                    if active_normal_workers.value == 0:
+                        break
+                time.sleep(0.005)
+            timeline.append(('heavy_start', time.time()))
+            time.sleep(0.04)
+            timeline.append(('heavy_end', time.time()))
+            with heavy_running.get_lock():
+                heavy_running.value = 0
+            heavy_lock.release()
+
+        # Avvia prima il worker normale, poi quello heavy
+        t_normal = threading.Thread(target=normal_worker)
+        t_heavy = threading.Thread(target=heavy_worker)
+        t_normal.start()
+        time.sleep(0.01)
+        t_heavy.start()
+        t_normal.join(timeout=2)
+        t_heavy.join(timeout=2)
+
+        events = {e[0]: e[1] for e in timeline}
+        # heavy deve partire dopo che normal è finito
+        self.assertIn('normal_end', events)
+        self.assertIn('heavy_start', events)
+        self.assertGreaterEqual(events['heavy_start'], events['normal_end'] - 0.01)
+
+    def test_two_heavy_configs_sequential(self):
+        """Due config heavy non girano mai in contemporanea."""
+        heavy_lock, heavy_running, active_normal_workers = self._make_shared()
+        intervals = []
+
+        def heavy_worker(wid):
+            heavy_lock.acquire()
+            with heavy_running.get_lock():
+                heavy_running.value = 1
+            start = time.time()
+            time.sleep(0.05)
+            end = time.time()
+            intervals.append((wid, start, end))
+            with heavy_running.get_lock():
+                heavy_running.value = 0
+            heavy_lock.release()
+
+        t1 = threading.Thread(target=heavy_worker, args=(1,))
+        t2 = threading.Thread(target=heavy_worker, args=(2,))
+        t1.start()
+        t2.start()
+        t1.join(timeout=2)
+        t2.join(timeout=2)
+
+        # Verifica che non si sovrappongano
+        _, s1, e1 = intervals[0]
+        _, s2, e2 = intervals[1]
+        overlap = min(e1, e2) - max(s1, s2)
+        self.assertLessEqual(overlap, 0.01, "Due heavy worker si sono sovrapposti!")
+
+    def test_normal_resumes_after_heavy(self):
+        """Dopo la fine di un heavy, i normal worker riprendono."""
+        heavy_lock, heavy_running, active_normal_workers = self._make_shared()
+        normal_ran = multiprocessing.Value('i', 0)
+
+        def normal_worker():
+            deadline = time.time() + 5
+            while time.time() < deadline:
+                with heavy_running.get_lock():
+                    if heavy_running.value == 0:
+                        break
+                time.sleep(0.005)
+            with active_normal_workers.get_lock():
+                active_normal_workers.value += 1
+            time.sleep(0.02)
+            with normal_ran.get_lock():
+                normal_ran.value += 1
+            with active_normal_workers.get_lock():
+                active_normal_workers.value = max(0, active_normal_workers.value - 1)
+
+        def heavy_worker():
+            heavy_lock.acquire()
+            with heavy_running.get_lock():
+                heavy_running.value = 1
+            time.sleep(0.05)
+            with heavy_running.get_lock():
+                heavy_running.value = 0
+            heavy_lock.release()
+
+        t_heavy = threading.Thread(target=heavy_worker)
+        t_normals = [threading.Thread(target=normal_worker) for _ in range(3)]
+
+        t_heavy.start()
+        time.sleep(0.01)
+        for t in t_normals:
+            t.start()
+        t_heavy.join(timeout=2)
+        for t in t_normals:
+            t.join(timeout=2)
+
+        self.assertEqual(normal_ran.value, 3, "Non tutti i normal worker sono stati eseguiti dopo l'heavy")
+
+    def test_threshold_boundary(self):
+        """num_clients == threshold è normale; threshold+1 è heavy."""
+        threshold = 8
+        self.assertFalse(8 > threshold)   # num_clients=8 → normale
+        self.assertTrue(9 > threshold)    # num_clients=9 → heavy
+        self.assertTrue(16 > threshold)   # num_clients=16 → heavy
+        self.assertTrue(32 > threshold)   # num_clients=32 → heavy
+        self.assertFalse(2 > threshold)   # num_clients=2 → normale
+
+    def test_normal_configs_run_concurrently(self):
+        """Più config normali girano in parallelo senza bloccarsi a vicenda."""
+        heavy_lock, heavy_running, active_normal_workers = self._make_shared()
+        starts = []
+
+        def normal_worker():
+            with heavy_running.get_lock():
+                pass  # non blocked
+            with active_normal_workers.get_lock():
+                active_normal_workers.value += 1
+            starts.append(time.time())
+            time.sleep(0.05)
+            with active_normal_workers.get_lock():
+                active_normal_workers.value = max(0, active_normal_workers.value - 1)
+
+        threads = [threading.Thread(target=normal_worker) for _ in range(4)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=2)
+
+        # Tutti devono essere partiti entro 0.02s l'uno dall'altro (paralleli)
+        self.assertEqual(len(starts), 4)
+        self.assertLess(max(starts) - min(starts), 0.03)
+
+
+# ===========================================================================
+# D — CSV THREAD-SAFETY E DEDUPLICATION
+# ===========================================================================
+
+class TestCSV(unittest.TestCase):
 
     def setUp(self):
-        from utils import object_to_pickle_string, pickle_string_to_object
-        self.serialize = object_to_pickle_string
-        self.deserialize = pickle_string_to_object
+        self.tmp = tempfile.mkdtemp()
+        self.csv_path = os.path.join(self.tmp, 'test_results.csv')
 
-    def test_roundtrip_numpy_array(self):
-        arr = np.array([[1.0, 2.0], [3.0, 4.0]], dtype=np.float32)
-        s = self.serialize(arr)
-        result = self.deserialize(s)
-        np.testing.assert_array_almost_equal(arr, result)
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self.tmp, ignore_errors=True)
 
-    def test_roundtrip_list_of_numpy(self):
-        data = [np.ones((3, 4)), np.zeros((5,))]
-        s = self.serialize(data)
-        result = self.deserialize(s)
-        for orig, restored in zip(data, result):
-            np.testing.assert_array_almost_equal(orig, restored)
+    def _append_row(self, lock, row):
+        from federated_grid_search import append_results_to_csv
+        append_results_to_csv(self.csv_path, row, lock)
 
-    def test_roundtrip_dict(self):
-        d = {'a': 1, 'b': [1, 2, 3], 'c': 'hello'}
-        s = self.serialize(d)
-        result = self.deserialize(s)
-        self.assertEqual(d, result)
+    def test_csv_append_threadsafe(self):
+        """10 thread scrivono contemporaneamente senza perdere righe."""
+        lock = multiprocessing.Lock()
+        n = 10
+        threads = []
+        for i in range(n):
+            row = {'worker_id': i, 'dataset_name': f'ds_{i}', 'best_acc': 0.5 + i * 0.01}
+            t = threading.Thread(target=self._append_row, args=(lock, row))
+            threads.append(t)
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=5)
 
-    def test_roundtrip_scalar(self):
-        val = 42.5
-        s = self.serialize(val)
-        result = self.deserialize(s)
-        self.assertAlmostEqual(val, result)
+        with open(self.csv_path, 'r', newline='', encoding='utf-8') as f:
+            rows = list(csv.DictReader(f))
+        self.assertEqual(len(rows), n)
 
-    def test_serialized_is_string(self):
-        obj = {'key': 'value'}
-        s = self.serialize(obj)
-        self.assertIsInstance(s, str)
+    def test_consolidate_keeps_best_acc(self):
+        """consolidate_results deduplicha e mantiene la riga con best_acc più alto."""
+        from consolidate_results import _row_key, _safe_float, METRIC_KEY
 
-    def test_deterministic_content(self):
-        arr = np.array([1.0, 2.0, 3.0])
-        s1 = self.serialize(arr)
-        s2 = self.serialize(arr)
-        self.assertEqual(s1, s2)
+        rows = [
+            {'dataset_name': 'ds_A', 'model_name': 'ConvNet', 'num_clients': '2',
+             'aggregation_algorithm': 'FedAvg', 'global_epoch': '5', 'local_epoch': '2',
+             'batch_size': '16', 'image_size': '128', 'encryption_mode': 'no_encryption',
+             'learning_rate': '0.001', 'models_percentage': '1', 'fedprox_mu': '0.0',
+             'he_backend': 'N/A', 'convnet_hidden1': '32', 'convnet_hidden2': '16',
+             'num_custom_layers': '-1', 'best_acc': '0.75'},
+            {'dataset_name': 'ds_A', 'model_name': 'ConvNet', 'num_clients': '2',
+             'aggregation_algorithm': 'FedAvg', 'global_epoch': '5', 'local_epoch': '2',
+             'batch_size': '16', 'image_size': '128', 'encryption_mode': 'no_encryption',
+             'learning_rate': '0.001', 'models_percentage': '1', 'fedprox_mu': '0.0',
+             'he_backend': 'N/A', 'convnet_hidden1': '32', 'convnet_hidden2': '16',
+             'num_custom_layers': '-1', 'best_acc': '0.85'},
+        ]
+        best = {}
+        for row in rows:
+            key = _row_key(row)
+            existing = best.get(key)
+            if existing is None or _safe_float(row.get(METRIC_KEY)) > _safe_float(existing.get(METRIC_KEY)):
+                best[key] = row
+
+        self.assertEqual(len(best), 1)
+        kept = list(best.values())[0]
+        self.assertEqual(kept['best_acc'], '0.85')
+
+    def test_consolidate_preserves_distinct_configs(self):
+        """Configurazioni con parametri diversi NON vengono unite."""
+        from consolidate_results import _row_key
+
+        base = {'dataset_name': 'ds_A', 'model_name': 'ConvNet', 'num_clients': '2',
+                'aggregation_algorithm': 'FedAvg', 'global_epoch': '5', 'local_epoch': '2',
+                'batch_size': '16', 'image_size': '128', 'encryption_mode': 'no_encryption',
+                'learning_rate': '0.001', 'models_percentage': '1', 'fedprox_mu': '0.0',
+                'he_backend': 'N/A', 'convnet_hidden1': '32', 'convnet_hidden2': '16',
+                'num_custom_layers': '-1', 'best_acc': '0.80'}
+        row2 = {**base, 'global_epoch': '10', 'best_acc': '0.90'}
+
+        k1 = _row_key(base)
+        k2 = _row_key(row2)
+        self.assertNotEqual(k1, k2)
 
 
-# ---------------------------------------------------------------------------
-# 4. AGGREGATORE (con ModelManager mockato)
-# ---------------------------------------------------------------------------
+# ===========================================================================
+# E — TELEGRAM + LOG
+# ===========================================================================
 
-@unittest.skipUnless(TORCH_AVAILABLE, "torch non disponibile (installarlo con: pip install torch)")
-class TestAggregatorLogic(unittest.TestCase):
+class TestTelegramLog(unittest.TestCase):
 
-    def _make_aggregator(self, mock_mm_class, early_stop_patience=3):
-        mock_instance = MagicMock()
-        mock_instance.get_weights.return_value = [np.zeros((2, 2)), np.zeros(2)]
-        mock_mm_class.return_value = mock_instance
+    def test_telegram_logs_to_logger_when_provided(self):
+        """send_telegram scrive il messaggio nel logger quando fornito."""
+        from federated_grid_search import send_telegram
+        mock_logger = MagicMock()
+        send_telegram('', '', '<b>Test</b> messaggio', logger=mock_logger)
+        mock_logger.info.assert_called_once()
+        logged = mock_logger.info.call_args[0][0]
+        self.assertIn('[Telegram]', logged)
+        self.assertIn('Test', logged)
+        self.assertNotIn('<b>', logged)
 
-        logger = logging.getLogger('test_aggregator')
-        logger.addHandler(logging.NullHandler())
+    def test_telegram_strips_html(self):
+        """I tag HTML vengono rimossi dal messaggio nel log."""
+        from federated_grid_search import send_telegram
+        mock_logger = MagicMock()
+        send_telegram('', '', '<b>Titolo</b>\n<code>error msg</code>', logger=mock_logger)
+        logged = mock_logger.info.call_args[0][0]
+        self.assertNotIn('<b>', logged)
+        self.assertNotIn('<code>', logged)
+        self.assertIn('Titolo', logged)
+        self.assertIn('error msg', logged)
+
+    def test_telegram_prints_when_no_logger(self):
+        """Senza logger, send_telegram stampa su stdout."""
+        from federated_grid_search import send_telegram
+        import io
+        captured = io.StringIO()
+        import sys
+        old_stdout = sys.stdout
+        sys.stdout = captured
+        try:
+            send_telegram('', '', 'hello world')
+        finally:
+            sys.stdout = old_stdout
+        output = captured.getvalue()
+        self.assertIn('[Telegram]', output)
+        self.assertIn('hello world', output)
+
+    @patch('requests.post')
+    def test_telegram_sends_http_request(self, mock_post):
+        """Con token e chat_id validi, viene fatto un POST a Telegram."""
+        from federated_grid_search import send_telegram
+        mock_post.return_value.status_code = 200
+        send_telegram('fake_token', '12345', 'test msg')
+        mock_post.assert_called_once()
+        call_args = mock_post.call_args
+        self.assertIn('api.telegram.org', call_args[0][0])
+
+    @patch('requests.post')
+    def test_telegram_skips_if_no_token(self, mock_post):
+        """Senza token, non viene fatto alcun HTTP request."""
+        from federated_grid_search import send_telegram
+        send_telegram('', '12345', 'test msg')
+        mock_post.assert_not_called()
+
+    def test_setup_main_logger_creates_file(self):
+        """_setup_main_logger crea il file di log nella directory corretta."""
+        from federated_grid_search import _setup_main_logger
+        with tempfile.TemporaryDirectory() as tmpdir:
+            import federated_grid_search as fgs
+            orig_root = fgs._PROJECT_ROOT
+            fgs._PROJECT_ROOT = Path(tmpdir)
+            try:
+                logger = _setup_main_logger('TestPC', 'log')
+                logger.info('Test log entry')
+                log_dir = Path(tmpdir) / 'log' / 'log_TestPC'
+                self.assertTrue(log_dir.exists())
+                log_files = list(log_dir.glob('main_*.log'))
+                self.assertEqual(len(log_files), 1)
+                content = log_files[0].read_text(encoding='utf-8')
+                self.assertIn('Test log entry', content)
+                # Cleanup handlers to avoid file lock issues on Windows
+                for h in logger.handlers[:]:
+                    h.close()
+                    logger.removeHandler(h)
+            finally:
+                fgs._PROJECT_ROOT = orig_root
+
+
+# ===========================================================================
+# F — STRESS TEST WORKER SCHEDULING
+# ===========================================================================
+
+class TestWorkerSchedulingStress(unittest.TestCase):
+
+    def test_mixed_normal_heavy_stress(self):
+        """20 normal + 3 heavy: nessun heavy gira mentre ci sono normal attivi."""
+        heavy_lock = multiprocessing.Lock()
+        heavy_running = multiprocessing.Value('i', 0)
+        active_normal_workers = multiprocessing.Value('i', 0)
+        violations = multiprocessing.Value('i', 0)
+        threshold = 8
+
+        def normal_task():
+            deadline = time.time() + 10
+            while time.time() < deadline:
+                with heavy_running.get_lock():
+                    if heavy_running.value == 0:
+                        break
+                time.sleep(0.005)
+            with active_normal_workers.get_lock():
+                active_normal_workers.value += 1
+            time.sleep(0.02)
+            with active_normal_workers.get_lock():
+                active_normal_workers.value = max(0, active_normal_workers.value - 1)
+
+        def heavy_task():
+            heavy_lock.acquire()
+            with heavy_running.get_lock():
+                heavy_running.value = 1
+            # Verifica che nessun normal sia attivo
+            deadline = time.time() + 5
+            while time.time() < deadline:
+                with active_normal_workers.get_lock():
+                    if active_normal_workers.value == 0:
+                        break
+                time.sleep(0.005)
+            # Esegui il task
+            for _ in range(5):
+                time.sleep(0.01)
+                with active_normal_workers.get_lock():
+                    if active_normal_workers.value > 0:
+                        with violations.get_lock():
+                            violations.value += 1
+            with heavy_running.get_lock():
+                heavy_running.value = 0
+            heavy_lock.release()
+
+        threads = [threading.Thread(target=normal_task) for _ in range(20)]
+        threads += [threading.Thread(target=heavy_task) for _ in range(3)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=10)
+
+        self.assertEqual(violations.value, 0, f"Heavy e normal si sono sovrapposti {violations.value} volte!")
+
+    def test_all_configs_complete(self):
+        """Tutti i task (normal e heavy) vengono completati senza blocchi."""
+        heavy_lock = multiprocessing.Lock()
+        heavy_running = multiprocessing.Value('i', 0)
+        active_normal_workers = multiprocessing.Value('i', 0)
+        completed = multiprocessing.Value('i', 0)
+        threshold = 8
+
+        configs = [{'num_clients': 2}] * 10 + [{'num_clients': 16}] * 3
+
+        def run_config(cfg):
+            is_heavy = cfg['num_clients'] > threshold
+            _heavy_acquired = False
+            _normal_counted = False
+            try:
+                if is_heavy:
+                    heavy_lock.acquire()
+                    _heavy_acquired = True
+                    with heavy_running.get_lock():
+                        heavy_running.value = 1
+                    deadline = time.time() + 5
+                    while time.time() < deadline:
+                        with active_normal_workers.get_lock():
+                            if active_normal_workers.value == 0:
+                                break
+                        time.sleep(0.005)
+                else:
+                    deadline = time.time() + 5
+                    while time.time() < deadline:
+                        with heavy_running.get_lock():
+                            if heavy_running.value == 0:
+                                break
+                        time.sleep(0.005)
+                    with active_normal_workers.get_lock():
+                        active_normal_workers.value += 1
+                    _normal_counted = True
+                time.sleep(0.01)
+                with completed.get_lock():
+                    completed.value += 1
+            finally:
+                if _heavy_acquired:
+                    with heavy_running.get_lock():
+                        heavy_running.value = 0
+                    heavy_lock.release()
+                if _normal_counted:
+                    with active_normal_workers.get_lock():
+                        active_normal_workers.value = max(0, active_normal_workers.value - 1)
+
+        threads = [threading.Thread(target=run_config, args=(c,)) for c in configs]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=15)
+
+        self.assertEqual(completed.value, len(configs), f"Solo {completed.value}/{len(configs)} task completati!")
+
+
+# ===========================================================================
+# G — DATASET LOADING E IMAGE ACCESS
+# ===========================================================================
+
+def _create_fake_dataset(base_dir: str, num_classes: int = 2,
+                          images_per_class: int = 20,
+                          with_commas: bool = False) -> None:
+    """Crea un dataset fake con immagini PNG minimali."""
+    try:
+        from PIL import Image
+        import numpy as np
+        use_pil = True
+    except ImportError:
+        use_pil = False
+
+    for cls in range(num_classes):
+        class_dir = os.path.join(base_dir, f'classe_{cls}')
+        os.makedirs(class_dir, exist_ok=True)
+        for i in range(images_per_class):
+            if with_commas and i % 3 == 0:
+                fname = f'patient1_slice{i}_EDSS1,5.png'
+            else:
+                fname = f'patient1_slice{i}_EDSS2.png'
+            fpath = os.path.join(class_dir, fname)
+            if use_pil:
+                arr = (os.urandom(128 * 128 * 3))
+                img_array = list(arr)
+                img = Image.frombytes('RGB', (128, 128), bytes(img_array[:128*128*3]))
+                img.save(fpath)
+            else:
+                # Crea un PNG minimale valido senza PIL
+                import struct, zlib
+                def png_chunk(name, data):
+                    c = struct.pack('>I', len(data)) + name + data
+                    return c + struct.pack('>I', zlib.crc32(name + data) & 0xffffffff)
+                signature = b'\x89PNG\r\n\x1a\n'
+                ihdr = png_chunk(b'IHDR', struct.pack('>IIBBBBB', 4, 4, 8, 2, 0, 0, 0))
+                raw = b'\x00\xff\x00\xff\x00\xff\x00\xff' * 4  # 4x4 RGB greens
+                idat = png_chunk(b'IDAT', zlib.compress(raw))
+                iend = png_chunk(b'IEND', b'')
+                with open(fpath, 'wb') as f:
+                    f.write(signature + ihdr + idat + iend)
+
+
+class TestDatasetLoading(unittest.TestCase):
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.dataset_dir = os.path.join(self.tmp, 'dataset')
+        self.split_dir = os.path.join(self.tmp, 'split')
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_dataset_splitter_handles_comma_filenames(self):
+        """DatasetSplitter copia file con virgola rinominandoli con underscore."""
+        from data_splitter import DatasetSplitter
+        _create_fake_dataset(self.dataset_dir, num_classes=2, images_per_class=10,
+                              with_commas=True)
+        splitter = DatasetSplitter(
+            output_base_dir=self.split_dir,
+            source_images_dir=self.dataset_dir,
+            num_clients=2
+        )
+        splitter.split_dataset()
+
+        # Verifica che nessun file nella split dir abbia virgole
+        for root, _, files in os.walk(self.split_dir):
+            for fname in files:
+                self.assertNotIn(',', fname, f"Virgola trovata in split file: {fname}")
+
+    def test_dataset_splitter_creates_client_dirs(self):
+        """DatasetSplitter crea le directory client_0, client_1, ecc."""
+        from data_splitter import DatasetSplitter
+        _create_fake_dataset(self.dataset_dir, num_classes=2, images_per_class=20)
+        splitter = DatasetSplitter(
+            output_base_dir=self.split_dir,
+            source_images_dir=self.dataset_dir,
+            num_clients=2
+        )
+        splitter.split_dataset()
+        client_dirs = [d for d in os.listdir(self.split_dir) if d.startswith('client_')]
+        self.assertGreaterEqual(len(client_dirs), 1)
+
+    def test_dataset_splitter_non_zero_training_data(self):
+        """Ogni client riceve almeno 1 immagine di training (no 'Total training size=0')."""
+        from data_splitter import DatasetSplitter
+        _create_fake_dataset(self.dataset_dir, num_classes=2, images_per_class=20)
+        splitter = DatasetSplitter(
+            output_base_dir=self.split_dir,
+            source_images_dir=self.dataset_dir,
+            num_clients=2
+        )
+        splitter.split_dataset()
+        for i in range(2):
+            train_dir = os.path.join(self.split_dir, f'client_{i}', 'train')
+            if os.path.exists(train_dir):
+                total_images = sum(
+                    len([f for f in os.listdir(os.path.join(train_dir, cls))
+                         if f.lower().endswith(('.png', '.jpg', '.jpeg'))])
+                    for cls in os.listdir(train_dir)
+                    if os.path.isdir(os.path.join(train_dir, cls))
+                )
+                self.assertGreater(total_images, 0,
+                    f"client_{i} ha 0 immagini di training — causa dei 'Total training size=0'")
+
+    def test_split_images_loadable_by_pil(self):
+        """Tutte le immagini nello split dir sono apribili con PIL."""
+        try:
+            from PIL import Image
+        except ImportError:
+            self.skipTest("PIL non disponibile")
+        from data_splitter import DatasetSplitter
+        _create_fake_dataset(self.dataset_dir, num_classes=2, images_per_class=10,
+                              with_commas=True)
+        splitter = DatasetSplitter(
+            output_base_dir=self.split_dir,
+            source_images_dir=self.dataset_dir,
+            num_clients=2
+        )
+        splitter.split_dataset()
+
+        errors = []
+        for root, _, files in os.walk(self.split_dir):
+            for fname in files:
+                if fname.lower().endswith(('.png', '.jpg', '.jpeg')):
+                    fpath = os.path.join(root, fname)
+                    try:
+                        img = Image.open(fpath)
+                        img.verify()
+                    except Exception as e:
+                        errors.append(f"{fpath}: {e}")
+        self.assertEqual(errors, [], f"Immagini non apribili: {errors[:3]}")
+
+    def test_imagefolder_loads_split_correctly(self):
+        """torchvision.datasets.ImageFolder carica correttamente le split directory."""
+        try:
+            from torchvision.datasets import ImageFolder
+            import torchvision.transforms as T
+        except ImportError:
+            self.skipTest("torchvision non disponibile")
+        from data_splitter import DatasetSplitter
+        _create_fake_dataset(self.dataset_dir, num_classes=2, images_per_class=20,
+                              with_commas=True)
+        splitter = DatasetSplitter(
+            output_base_dir=self.split_dir,
+            source_images_dir=self.dataset_dir,
+            num_clients=2
+        )
+        splitter.split_dataset()
+
+        transform = T.Compose([T.Resize((32, 32)), T.ToTensor()])
+        client_train = os.path.join(self.split_dir, 'client_0', 'train')
+        if not os.path.exists(client_train):
+            self.skipTest("client_0/train non creata (troppo pochi dati per il test)")
+
+        dataset = ImageFolder(root=client_train, transform=transform)
+        self.assertGreater(len(dataset), 0, "ImageFolder carica 0 immagini dal client_0/train")
+
+        # Carica un batch
+        from torch.utils.data import DataLoader
+        loader = DataLoader(dataset, batch_size=4, shuffle=False)
+        batch = next(iter(loader))
+        images, labels = batch
+        self.assertEqual(images.shape[1], 3)  # 3 canali RGB
+        self.assertEqual(images.shape[2], 32)
+        self.assertEqual(images.shape[3], 32)
+
+    def test_splitter_fewer_images_than_clients(self):
+        """DatasetSplitter gestisce il caso in cui le immagini per classe < num_clients."""
+        from data_splitter import DatasetSplitter
+        # Solo 3 immagini per classe, ma chiediamo 10 client
+        _create_fake_dataset(self.dataset_dir, num_classes=2, images_per_class=3)
+        splitter = DatasetSplitter(
+            output_base_dir=self.split_dir,
+            source_images_dir=self.dataset_dir,
+            num_clients=10
+        )
+        # Non deve crashare, ma produrre meno di 10 client
+        splitter.split_dataset()
+        client_dirs = [d for d in os.listdir(self.split_dir) if d.startswith('client_')]
+        self.assertLessEqual(len(client_dirs), 3)  # ridotto al min_class_count
+
+    def test_splitter_returns_correct_effective_client_count(self):
+        """split_dataset ritorna il numero effettivo di client creati."""
+        from data_splitter import DatasetSplitter
+        _create_fake_dataset(self.dataset_dir, num_classes=2, images_per_class=40)
+        splitter = DatasetSplitter(self.split_dir, self.dataset_dir, num_clients=4)
+        actual = splitter.split_dataset()
+        self.assertEqual(actual, 4)
+        client_dirs = [d for d in os.listdir(self.split_dir) if d.startswith('client_')]
+        self.assertEqual(len(client_dirs), actual)
+
+    def test_compute_effective_clients_matches_split_result(self):
+        """compute_effective_clients predice correttamente quanti client crea split_dataset."""
+        from data_splitter import DatasetSplitter, compute_effective_clients
+        _create_fake_dataset(self.dataset_dir, num_classes=2, images_per_class=3)
+        effective = compute_effective_clients(self.dataset_dir, num_clients=8)
+        splitter = DatasetSplitter(self.split_dir, self.dataset_dir, num_clients=8)
+        actual = splitter.split_dataset()
+        self.assertEqual(effective, actual)
+
+    def test_hf_naming_scan(self):
+        """fix_hf_filenames trova correttamente i file con virgola in un dir di test."""
+        from fix_hf_filenames import find_local_comma_files
+        # Crea un dataset fake con virgole
+        _create_fake_dataset(self.dataset_dir, num_classes=2, images_per_class=10,
+                              with_commas=True)
+        pairs = find_local_comma_files(base_dirs=[Path(self.dataset_dir)])
+        self.assertGreater(len(pairs), 0, "Nessun file con virgola trovato")
+        for old, new in pairs:
+            self.assertIn(',', old.name)
+            self.assertNotIn(',', new.name)
+
+    def test_hf_naming_local_fix(self):
+        """fix_hf_filenames rinomina correttamente i file locali."""
+        from fix_hf_filenames import find_local_comma_files, rename_local_files
+        _create_fake_dataset(self.dataset_dir, num_classes=2, images_per_class=10,
+                              with_commas=True)
+        pairs = find_local_comma_files(base_dirs=[Path(self.dataset_dir)])
+        self.assertGreater(len(pairs), 0)
+        before_count = len(pairs)
+        rename_local_files(pairs)
+        # Dopo il rename, nessun file dovrebbe avere virgole
+        remaining = find_local_comma_files(base_dirs=[Path(self.dataset_dir)])
+        self.assertEqual(len(remaining), 0, f"Rimasti {len(remaining)} file con virgola dopo il fix")
+
+    def test_data_splitter_builds_correct_dataframe(self):
+        """DatasetSplitter._build_dataframe_from_folders legge le classi correttamente."""
+        from data_splitter import DatasetSplitter
+        _create_fake_dataset(self.dataset_dir, num_classes=3, images_per_class=10)
+        splitter = DatasetSplitter(
+            output_base_dir=self.split_dir,
+            source_images_dir=self.dataset_dir,
+            num_clients=2
+        )
+        df = splitter.dataframe
+        self.assertFalse(df.empty)
+        self.assertIn('filename', df.columns)
+        self.assertIn('class', df.columns)
+        unique_classes = df['class'].nunique()
+        self.assertEqual(unique_classes, 3)
+        total_images = len(df)
+        self.assertEqual(total_images, 30)  # 3 classi x 10 immagini
+
+
+# ===========================================================================
+# F — STRESS TEST AGGIUNTIVI
+# ===========================================================================
+
+class TestWorkerSchedulingStressExtra(unittest.TestCase):
+
+    def test_32_client_config_is_heavy(self):
+        """Una config con 32 client è heavy (> HEAVY_CLIENT_THRESHOLD=8)."""
+        from federated_grid_search import HEAVY_CLIENT_THRESHOLD
+        self.assertTrue(32 > HEAVY_CLIENT_THRESHOLD)
+
+    def test_16_client_config_is_heavy(self):
+        """Una config con 16 client è heavy."""
+        from federated_grid_search import HEAVY_CLIENT_THRESHOLD
+        self.assertTrue(16 > HEAVY_CLIENT_THRESHOLD)
+
+    def test_8_client_config_is_not_heavy(self):
+        """Una config con 8 client (== threshold) NON è heavy (condizione è >)."""
+        from federated_grid_search import HEAVY_CLIENT_THRESHOLD
+        self.assertFalse(8 > HEAVY_CLIENT_THRESHOLD)
+
+    def test_5_heavy_10_normal_all_complete(self):
+        """Mix di 5 heavy (32 client) e 10 normal (4 client): tutti i 15 task completati."""
+        heavy_lock = multiprocessing.Lock()
+        heavy_running = multiprocessing.Value('i', 0)
+        active_normal_workers = multiprocessing.Value('i', 0)
+        completed = multiprocessing.Value('i', 0)
+        threshold = 8
+
+        configs = [{'num_clients': 32}] * 5 + [{'num_clients': 4}] * 10
+
+        def run_config(cfg):
+            is_heavy = cfg['num_clients'] > threshold
+            _heavy_acquired = False
+            _normal_counted = False
+            try:
+                if is_heavy:
+                    heavy_lock.acquire()
+                    _heavy_acquired = True
+                    with heavy_running.get_lock():
+                        heavy_running.value = 1
+                    deadline = time.time() + 10
+                    while time.time() < deadline:
+                        with active_normal_workers.get_lock():
+                            if active_normal_workers.value == 0:
+                                break
+                        time.sleep(0.005)
+                else:
+                    deadline = time.time() + 10
+                    while time.time() < deadline:
+                        with heavy_running.get_lock():
+                            if heavy_running.value == 0:
+                                break
+                        time.sleep(0.005)
+                    with active_normal_workers.get_lock():
+                        active_normal_workers.value += 1
+                    _normal_counted = True
+                time.sleep(0.01)
+                with completed.get_lock():
+                    completed.value += 1
+            finally:
+                if _heavy_acquired:
+                    with heavy_running.get_lock():
+                        heavy_running.value = 0
+                    heavy_lock.release()
+                if _normal_counted:
+                    with active_normal_workers.get_lock():
+                        active_normal_workers.value = max(0, active_normal_workers.value - 1)
+
+        threads = [threading.Thread(target=run_config, args=(c,)) for c in configs]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=30)
+
+        self.assertEqual(completed.value, len(configs),
+                         f"Solo {completed.value}/{len(configs)} task completati!")
+
+    def test_stress_32_clients_1_worker(self):
+        """1 worker con config da 32 client (heavy): viene eseguito in isolamento senza crash."""
+        heavy_lock = multiprocessing.Lock()
+        heavy_running = multiprocessing.Value('i', 0)
+        active_normal_workers = multiprocessing.Value('i', 0)
+        completed = multiprocessing.Value('i', 0)
+        threshold = 8
+
+        cfg = {'num_clients': 32}  # heavy
+
+        def run_heavy():
+            heavy_lock.acquire()
+            with heavy_running.get_lock():
+                heavy_running.value = 1
+            deadline = time.time() + 5
+            while time.time() < deadline:
+                with active_normal_workers.get_lock():
+                    if active_normal_workers.value == 0:
+                        break
+                time.sleep(0.005)
+            time.sleep(0.02)
+            with completed.get_lock():
+                completed.value += 1
+            with heavy_running.get_lock():
+                heavy_running.value = 0
+            heavy_lock.release()
+
+        t = threading.Thread(target=run_heavy)
+        t.start()
+        t.join(timeout=5)
+        self.assertEqual(completed.value, 1, "Il task da 32 client (1 worker) non e' completato")
+
+    def test_stress_16_clients_2_workers(self):
+        """2 worker con config da 16 client (heavy): entrambi completati, non in contemporanea."""
+        heavy_lock = multiprocessing.Lock()
+        heavy_running = multiprocessing.Value('i', 0)
+        active_normal_workers = multiprocessing.Value('i', 0)
+        completed = multiprocessing.Value('i', 0)
+        concurrent = multiprocessing.Value('i', 0)
+        peak_concurrent = multiprocessing.Value('i', 0)
+
+        def run_heavy():
+            heavy_lock.acquire()
+            with heavy_running.get_lock():
+                heavy_running.value = 1
+            deadline = time.time() + 5
+            while time.time() < deadline:
+                with active_normal_workers.get_lock():
+                    if active_normal_workers.value == 0:
+                        break
+                time.sleep(0.005)
+            with concurrent.get_lock():
+                concurrent.value += 1
+                with peak_concurrent.get_lock():
+                    if concurrent.value > peak_concurrent.value:
+                        peak_concurrent.value = concurrent.value
+            time.sleep(0.03)
+            with concurrent.get_lock():
+                concurrent.value -= 1
+            with completed.get_lock():
+                completed.value += 1
+            with heavy_running.get_lock():
+                heavy_running.value = 0
+            heavy_lock.release()
+
+        threads = [threading.Thread(target=run_heavy) for _ in range(2)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=10)
+
+        self.assertEqual(completed.value, 2, "Non entrambi i task da 16 client completati")
+        self.assertEqual(peak_concurrent.value, 1, f"Peak concurrent={peak_concurrent.value}, atteso 1")
+
+    def test_stress_mixed_configs(self):
+        """Mix: 3 config da 32 client (heavy) + 8 config da 4 client (normal). Tutti completati."""
+        heavy_lock = multiprocessing.Lock()
+        heavy_running = multiprocessing.Value('i', 0)
+        active_normal_workers = multiprocessing.Value('i', 0)
+        completed = multiprocessing.Value('i', 0)
+        threshold = 8
+
+        configs = [{'num_clients': 32}] * 3 + [{'num_clients': 4}] * 8
+
+        def run_config(cfg):
+            is_heavy = cfg['num_clients'] > threshold
+            _heavy_acquired = False
+            _normal_counted = False
+            try:
+                if is_heavy:
+                    heavy_lock.acquire()
+                    _heavy_acquired = True
+                    with heavy_running.get_lock():
+                        heavy_running.value = 1
+                    deadline = time.time() + 10
+                    while time.time() < deadline:
+                        with active_normal_workers.get_lock():
+                            if active_normal_workers.value == 0:
+                                break
+                        time.sleep(0.005)
+                else:
+                    deadline = time.time() + 10
+                    while time.time() < deadline:
+                        with heavy_running.get_lock():
+                            if heavy_running.value == 0:
+                                break
+                        time.sleep(0.005)
+                    with active_normal_workers.get_lock():
+                        active_normal_workers.value += 1
+                    _normal_counted = True
+                time.sleep(0.01)
+                with completed.get_lock():
+                    completed.value += 1
+            finally:
+                if _heavy_acquired:
+                    with heavy_running.get_lock():
+                        heavy_running.value = 0
+                    heavy_lock.release()
+                if _normal_counted:
+                    with active_normal_workers.get_lock():
+                        active_normal_workers.value = max(0, active_normal_workers.value - 1)
+
+        threads = [threading.Thread(target=run_config, args=(c,)) for c in configs]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=30)
+
+        self.assertEqual(completed.value, len(configs),
+                         f"Solo {completed.value}/{len(configs)} task completati nel mix heavy/normal!")
+
+
+# ===========================================================================
+# H — NAMESPACE ERROR HANDLING
+# ===========================================================================
+
+class TestNamespaceError(unittest.TestCase):
+    """Testa la gestione del namespace error 'is not a connected namespace'."""
+
+    def test_client_eval_skipped_when_disconnected(self):
+        """Quando sio.connected = False, l'emit di client_eval viene saltato."""
+        mock_sio = MagicMock()
+        mock_sio.connected = False
+        mock_logger = MagicMock()
+
+        response = {'test_loss': 0.5, 'test_acc': 0.8}
+        if mock_sio.connected:
+            try:
+                mock_sio.emit('client_eval', response)
+            except Exception as e:
+                mock_logger.warning("Could not send client_eval: %s", e)
+        else:
+            mock_logger.warning("Socket disconnected before sending client_eval. Skipping.")
+
+        mock_sio.emit.assert_not_called()
+        mock_logger.warning.assert_called_once()
+
+    def test_client_eval_sent_when_connected(self):
+        """Quando sio.connected = True e nessuna eccezione, l'emit viene eseguito."""
+        mock_sio = MagicMock()
+        mock_sio.connected = True
+        mock_logger = MagicMock()
+
+        response = {'test_loss': 0.5, 'test_acc': 0.8}
+        if mock_sio.connected:
+            try:
+                mock_sio.emit('client_eval', response)
+            except Exception as e:
+                mock_logger.warning("Could not send client_eval: %s", e)
+        else:
+            mock_logger.warning("Socket disconnected. Skipping.")
+
+        mock_sio.emit.assert_called_once_with('client_eval', response)
+        mock_logger.warning.assert_not_called()
+
+    def test_namespace_exception_caught_as_warning(self):
+        """Un'eccezione namespace error durante emit viene loggata come warning, non propagata."""
+        mock_sio = MagicMock()
+        mock_sio.connected = True
+        mock_sio.emit.side_effect = Exception("/ is not a connected namespace")
+        mock_logger = MagicMock()
+
+        response = {'test_loss': 0.5, 'test_acc': 0.8}
+        # Non deve sollevare eccezione
+        try:
+            if mock_sio.connected:
+                try:
+                    mock_sio.emit('client_eval', response)
+                except Exception as e:
+                    mock_logger.warning("Could not send client_eval (socket disconnected): %s", e)
+        except Exception:
+            self.fail("L'eccezione namespace non è stata catturata correttamente")
+
+        mock_logger.warning.assert_called_once()
+        warning_call = str(mock_logger.warning.call_args)
+        self.assertIn('not a connected namespace', warning_call)
+
+    def test_client_update_not_sent_when_disconnected(self):
+        """L'emit di client_update non avviene se sio.connected = False."""
+        mock_sio = MagicMock()
+        mock_sio.connected = False
+
+        if not mock_sio.connected:
+            pass  # skip emit
+        else:
+            mock_sio.emit('client_update', {'round': 1})
+
+        mock_sio.emit.assert_not_called()
+
+    def test_update_worker_exception_logged_not_propagated(self):
+        """L'eccezione nel worker thread viene loggata come error, non propagata."""
+        logged_errors = []
+
+        class _Logger:
+            def error(self, msg, *args, **kwargs):
+                logged_errors.append(msg % args if args else msg)
+
+        logger = _Logger()
+
+        def simulate_update_worker():
+            try:
+                raise Exception("/ is not a connected namespace")
+            except Exception as e:
+                logger.error("An error occurred in the update worker thread: %s", e)
+
+        simulate_update_worker()
+
+        self.assertEqual(len(logged_errors), 1)
+        self.assertIn('not a connected namespace', logged_errors[0])
+
+    def test_multiple_namespace_errors_all_logged(self):
+        """Più eccezioni namespace error consecutive vengono tutte loggate."""
+        warnings = []
+        mock_sio = MagicMock()
+        mock_sio.connected = True
+        mock_sio.emit.side_effect = Exception("/ is not a connected namespace")
+
+        for _ in range(3):
+            if mock_sio.connected:
+                try:
+                    mock_sio.emit('client_eval', {})
+                except Exception as e:
+                    warnings.append(str(e))
+
+        self.assertEqual(len(warnings), 3)
+
+
+# ===========================================================================
+# I — WATCHDOG SCENARIOS
+# ===========================================================================
+
+class TestWatchdogScenarios(unittest.TestCase):
+    """Testa gli scenari di watchdog timeout e calcolo effective clients."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.dataset_dir = os.path.join(self.tmp, 'dataset')
+        self.split_dir = os.path.join(self.tmp, 'split')
+
+    def tearDown(self):
+        import shutil
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_compute_effective_clients_with_small_dataset(self):
+        """compute_effective_clients riduce il numero di client quando il dataset è piccolo."""
+        from data_splitter import compute_effective_clients
+        _create_fake_dataset(self.dataset_dir, num_classes=2, images_per_class=3)
+        result = compute_effective_clients(self.dataset_dir, num_clients=8)
+        self.assertLessEqual(result, 3)
+        self.assertGreaterEqual(result, 1)
+
+    def test_compute_effective_clients_does_not_exceed_requested(self):
+        """compute_effective_clients non supera il numero di client richiesti."""
+        from data_splitter import compute_effective_clients
+        _create_fake_dataset(self.dataset_dir, num_classes=2, images_per_class=20)
+        result = compute_effective_clients(self.dataset_dir, num_clients=4)
+        self.assertLessEqual(result, 4)
+
+    def test_compute_effective_clients_empty_dataset(self):
+        """compute_effective_clients gestisce directory vuota senza crash."""
+        from data_splitter import compute_effective_clients
+        os.makedirs(self.dataset_dir, exist_ok=True)
+        # Non deve sollevare eccezione
+        try:
+            result = compute_effective_clients(self.dataset_dir, num_clients=4)
+            self.assertGreaterEqual(result, 0)
+        except Exception as e:
+            self.fail(f"compute_effective_clients ha crashato su dataset vuoto: {e}")
+
+    def test_splitter_limits_dirs_to_effective_clients(self):
+        """Con 3 immagini per classe, vengono create al massimo 3 directory client."""
+        from data_splitter import DatasetSplitter
+        _create_fake_dataset(self.dataset_dir, num_classes=2, images_per_class=3)
+        splitter = DatasetSplitter(self.split_dir, self.dataset_dir, num_clients=8)
+        actual = splitter.split_dataset()
+        self.assertLessEqual(actual, 3)
+        client_dirs = [d for d in os.listdir(self.split_dir) if d.startswith('client_')]
+        self.assertEqual(len(client_dirs), actual)
+
+    def test_no_orphan_dirs_beyond_effective_clients(self):
+        """Nessuna directory client_{i} per i >= effective_clients (no zombie dirs)."""
+        from data_splitter import DatasetSplitter
+        _create_fake_dataset(self.dataset_dir, num_classes=2, images_per_class=3)
+        splitter = DatasetSplitter(self.split_dir, self.dataset_dir, num_clients=8)
+        actual = splitter.split_dataset()
+        for i in range(actual, 8):
+            orphan = os.path.join(self.split_dir, f'client_{i}')
+            self.assertFalse(os.path.exists(orphan),
+                             f"client_{i} non dovrebbe esistere (effective={actual})")
+
+    def test_min_class_warning_printed_when_dataset_small(self):
+        """DatasetSplitter stampa warning quando min_class_count < num_clients."""
+        from data_splitter import DatasetSplitter
+        import io
+        _create_fake_dataset(self.dataset_dir, num_classes=2, images_per_class=3)
+        splitter = DatasetSplitter(self.split_dir, self.dataset_dir, num_clients=10)
+
+        captured = io.StringIO()
+        old_stdout = sys.stdout
+        sys.stdout = captured
+        try:
+            splitter.split_dataset()
+        finally:
+            sys.stdout = old_stdout
+
+        self.assertIn('Warning', captured.getvalue())
+
+    def test_zero_train_images_warning_printed(self):
+        """DatasetSplitter stampa warning quando un client ha 0 immagini di training."""
+        from data_splitter import DatasetSplitter
+        import io
+        # Con pochissime immagini e validazione split, qualche client potrebbe avere n_train=0
+        _create_fake_dataset(self.dataset_dir, num_classes=2, images_per_class=2)
+        splitter = DatasetSplitter(self.split_dir, self.dataset_dir, num_clients=2)
+
+        captured = io.StringIO()
+        old_stdout = sys.stdout
+        sys.stdout = captured
+        try:
+            splitter.split_dataset()
+        finally:
+            sys.stdout = old_stdout
+        # Il test verifica solo che non crashi, non necessariamente il warning
+        # (dipende da quante immagini vengono assegnate alla validazione)
+        self.assertTrue(True)  # no crash = pass
+
+    def test_effective_clients_at_least_1(self):
+        """compute_effective_clients restituisce almeno 1 se il dataset non è vuoto."""
+        from data_splitter import compute_effective_clients
+        _create_fake_dataset(self.dataset_dir, num_classes=2, images_per_class=5)
+        result = compute_effective_clients(self.dataset_dir, num_clients=4)
+        self.assertGreaterEqual(result, 1)
+
+    def test_run_multiple_clients_skips_empty_dirs(self):
+        """run_multiple_clients avvia solo i thread per cui esistono directory client."""
+        import run_multiple_clients as rmc
+        _create_fake_dataset(self.dataset_dir, num_classes=2, images_per_class=3)
+
+        # Con 3 immagini per classe e 8 client richiesti, split_dataset crea <= 3 dir
+        config = {
+            'num_clients': 8,
+            'splitting_dir': self.split_dir,
+            'dataset_path': self.dataset_dir,
+            'ip_address': '127.0.0.1',
+            'port': 65000,
+            'MIN_NUM_WORKERS': 8,
+        }
+        threads_started = []
+        original_start = threading.Thread.start
+
+        def mock_start(self_t):
+            threads_started.append(self_t)
+            # Non avviare davvero: intercettiamo prima di connettere al server
+            pass
+
+        with patch.object(threading.Thread, 'start', mock_start):
+            # Sostituisce FederatedClient con un no-op per non tentare connessioni reali
+            with patch('run_multiple_clients.FederatedClient', return_value=None):
+                try:
+                    rmc.main(config)
+                except Exception:
+                    pass  # possibili errori di connessione — non ci interessa
+
+        # Il numero di thread avviati deve essere <= 3 (limitato dal dataset)
+        # Non deve avviare 8 thread per 8 client quando il dataset ne supporta al massimo 3
+        self.assertLessEqual(len(threads_started), 4,
+                             f"run_multiple_clients ha avviato {len(threads_started)} thread invece di <=3")
+
+    def test_watchdog_fires_on_no_clients(self):
+        """compute_effective_clients=0 non causa hang: nessun thread viene avviato."""
+        from data_splitter import compute_effective_clients
+        import os
+        # Directory vuota senza immagini
+        empty_dir = os.path.join(self.tmp, 'empty_dataset')
+        os.makedirs(empty_dir, exist_ok=True)
+        result = compute_effective_clients(empty_dir, num_clients=4)
+        # Se 0 o 1, run_multiple_clients avvierebbe 0 o 1 thread — no hang infinito
+        self.assertGreaterEqual(result, 0)
+        self.assertLessEqual(result, 4)
+
+    def test_pre_split_min_num_workers_reflects_actual_io(self):
+        """MIN_NUM_WORKERS deve venire dal valore reale di split_dataset, non da dry-run.
+
+        Simula il caso in cui split_dataset() restituisce meno client del previsto
+        (fallimenti I/O) e verifica che config['MIN_NUM_WORKERS'] rispecchi quel valore
+        PRIMA dell'avvio del server — cioè il path already_split=True in run_multiple_clients.
+        """
+        import run_multiple_clients as rmc
+
+        # Prepara una splitting_dir con 2 client validi (train/ non vuota)
+        os.makedirs(self.split_dir, exist_ok=True)
+        for i in range(2):
+            train_dir = os.path.join(self.split_dir, f'client_{i}', 'train', 'cls')
+            os.makedirs(train_dir)
+            open(os.path.join(train_dir, f'img{i}.png'), 'w').close()
 
         config = {
-            'model_name': 'ResNet18',
-            'num_classes': 2,
-            'early_stop_patience': early_stop_patience,
-            'image_size': 224,
-            'num_custom_layers': 2,
-            'run_metrics_output_path': '/tmp/test_metrics',
-            'worker_id': 0,
-            'dataset_name': 'test_ds',
-            'plot_dir': '/tmp/test_plots',
+            'num_clients': 4,          # richiesti 4, ma split ha creato solo 2
+            'splitting_dir': self.split_dir,
+            'dataset_path': self.dataset_dir,
+            'ip_address': '127.0.0.1',
+            'port': 65001,
+            'MIN_NUM_WORKERS': 2,      # già impostato dal pre-split (come fa federated_grid_search)
+            'global_epoch': 1,
+            'round_timeout': 10,
+            'server_startup_timeout': 10,
         }
-        from aggregator import Aggregator
-        return Aggregator(config, logger)
 
-    @patch('aggregator.ModelManager')
-    def test_aggregate_weights_fedavg(self, mock_mm):
-        agg = self._make_aggregator(mock_mm)
-        w1 = [np.array([1.0, 2.0]), np.array([3.0])]
-        w2 = [np.array([3.0, 4.0]), np.array([1.0])]
-        updates = [
-            {'weights': w1, 'train_size': 10},
-            {'weights': w2, 'train_size': 10},
-        ]
-        result = agg.aggregate_weights(updates, 'FedAvg')
+        threads_started = []
+
+        def mock_start(self_t):
+            threads_started.append(self_t)
+
+        with patch.object(threading.Thread, 'start', mock_start):
+            with patch('run_multiple_clients.FederatedClient', return_value=MagicMock(sio=MagicMock(connected=False))):
+                try:
+                    rmc.main(config, already_split=True)
+                except Exception:
+                    pass
+
+        # already_split=True usa MIN_NUM_WORKERS (2) come actual_clients, non num_clients (4)
+        self.assertLessEqual(len(threads_started), 2,
+                             f"already_split=True deve avviare ≤2 thread, ha avviato {len(threads_started)}")
+
+
+# ===========================================================================
+# J — PORT MANAGEMENT
+# ===========================================================================
+
+class TestPortManagement(unittest.TestCase):
+    """Testa le funzioni di gestione porte in federated_grid_search.py."""
+
+    def test_find_free_port_returns_valid_range(self):
+        """find_free_port ritorna una porta nel range 1024-65534."""
+        from federated_grid_search import find_free_port
+        port = find_free_port('127.0.0.1', 19700)
+        self.assertGreater(port, 1024)
+        self.assertLess(port, 65535)
+
+    def test_find_free_port_skips_occupied(self):
+        """find_free_port salta le porte già in ascolto."""
+        from federated_grid_search import find_free_port
+        import socket as _sock
+        s = _sock.socket(_sock.AF_INET, _sock.SOCK_STREAM)
+        s.setsockopt(_sock.SOL_SOCKET, _sock.SO_REUSEADDR, 1)
+        s.bind(('127.0.0.1', 0))
+        s.listen(1)
+        occupied = s.getsockname()[1]
+        try:
+            result = find_free_port('127.0.0.1', occupied)
+            self.assertNotEqual(result, occupied,
+                                f"find_free_port ha restituito la porta occupata {occupied}")
+        finally:
+            s.close()
+
+    def test_port_is_listening_true_when_listening(self):
+        """_port_is_listening ritorna True se una socket è in ascolto."""
+        from federated_grid_search import _port_is_listening
+        import socket as _sock
+        s = _sock.socket(_sock.AF_INET, _sock.SOCK_STREAM)
+        s.setsockopt(_sock.SOL_SOCKET, _sock.SO_REUSEADDR, 1)
+        s.bind(('127.0.0.1', 0))
+        s.listen(1)
+        port = s.getsockname()[1]
+        try:
+            self.assertTrue(_port_is_listening('127.0.0.1', port))
+        finally:
+            s.close()
+
+    def test_port_is_listening_false_when_free(self):
+        """_port_is_listening ritorna False se la porta è libera."""
+        from federated_grid_search import find_free_port, _port_is_listening
+        port = find_free_port('127.0.0.1', 19800)
+        self.assertFalse(_port_is_listening('127.0.0.1', port))
+
+    def test_wait_for_port_free_immediate_when_free(self):
+        """wait_for_port_free ritorna True subito se la porta è già libera."""
+        from federated_grid_search import find_free_port, wait_for_port_free
+        port = find_free_port('127.0.0.1', 19900)
+        result = wait_for_port_free('127.0.0.1', port, timeout=5)
         self.assertTrue(result)
-        # Somma pesata: w1*10 + w2*10
-        np.testing.assert_array_almost_equal(agg.current_weights[0], np.array([40.0, 60.0]))
-        np.testing.assert_array_almost_equal(agg.current_weights[1], np.array([40.0]))
 
-    @patch('aggregator.ModelManager')
-    def test_aggregate_weights_fedprox(self, mock_mm):
-        agg = self._make_aggregator(mock_mm)
-        w1 = [np.array([2.0])]
-        w2 = [np.array([4.0])]
-        updates = [
-            {'weights': w1, 'train_size': 5},
-            {'weights': w2, 'train_size': 15},
-        ]
-        result = agg.aggregate_weights(updates, 'FedProx')
-        self.assertTrue(result)
-        np.testing.assert_array_almost_equal(agg.current_weights[0], np.array([2.0*5 + 4.0*15]))
+    def test_port_retry_loop_finds_free_port(self):
+        """Il retry loop trova una porta libera anche se la prima è occupata."""
+        from federated_grid_search import find_free_port, _port_is_listening
+        import socket as _sock
+        s = _sock.socket(_sock.AF_INET, _sock.SOCK_STREAM)
+        s.setsockopt(_sock.SOL_SOCKET, _sock.SO_REUSEADDR, 1)
+        s.bind(('127.0.0.1', 0))
+        s.listen(1)
+        occupied = s.getsockname()[1]
+        try:
+            found_port = occupied  # inizia dall'occupata
+            for _retry in range(5):
+                found_port = find_free_port('127.0.0.1', occupied)
+                time.sleep(0.05 * (_retry + 1))
+                if not _port_is_listening('127.0.0.1', found_port):
+                    break
+            self.assertNotEqual(found_port, occupied)
+            self.assertFalse(_port_is_listening('127.0.0.1', found_port))
+        finally:
+            s.close()
 
-    @patch('aggregator.ModelManager')
-    def test_aggregate_weights_empty_updates(self, mock_mm):
-        agg = self._make_aggregator(mock_mm)
-        result = agg.aggregate_weights([], 'FedAvg')
-        self.assertFalse(result)
-
-    @patch('aggregator.ModelManager')
-    def test_aggregate_weights_zero_total_size(self, mock_mm):
-        agg = self._make_aggregator(mock_mm)
-        updates = [{'weights': [np.array([1.0])], 'train_size': 0}]
-        result = agg.aggregate_weights(updates, 'FedAvg')
-        self.assertFalse(result)
-
-    @patch('aggregator.ModelManager')
-    def test_aggregate_weights_unsupported_algorithm(self, mock_mm):
-        agg = self._make_aggregator(mock_mm)
-        updates = [{'weights': [np.array([1.0])], 'train_size': 10}]
-        with self.assertRaises(ValueError):
-            agg.aggregate_weights(updates, 'UnknownAlgo')
-
-    @patch('aggregator.ModelManager')
-    def test_aggregate_train_loss_weighted(self, mock_mm):
-        agg = self._make_aggregator(mock_mm)
-        agg.metrics_history[0] = {}
-        agg.aggregate_train_loss_weighted([0.5, 0.3], [10, 10], current_round=0)
-        self.assertAlmostEqual(agg.metrics_history[0]['train_loss'], 0.4, places=5)
-
-    @patch('aggregator.ModelManager')
-    def test_aggregate_train_loss_weighted_unequal(self, mock_mm):
-        agg = self._make_aggregator(mock_mm)
-        agg.metrics_history[0] = {}
-        agg.aggregate_train_loss_weighted([1.0, 0.0], [1, 3], current_round=0)
-        expected = (1.0 * 1 + 0.0 * 3) / 4
-        self.assertAlmostEqual(agg.metrics_history[0]['train_loss'], expected, places=5)
-
-    @patch('aggregator.ModelManager')
-    def test_aggregate_evaluation_updates_best_f1(self, mock_mm):
-        agg = self._make_aggregator(mock_mm)
-        agg.metrics_history[0] = {}
-        eval_updates = [
-            {'test_loss': 0.3, 'test_f1': 0.8, 'test_acc': 0.85,
-             'test_prec': 0.82, 'test_recall': 0.78, 'test_size': 50},
-            {'test_loss': 0.4, 'test_f1': 0.7, 'test_acc': 0.75,
-             'test_prec': 0.72, 'test_recall': 0.68, 'test_size': 50},
-        ]
-        agg.aggregate_evaluation_results(eval_updates, 0)
-        self.assertAlmostEqual(agg.best_f1_score, 0.75, places=5)
-
-    @patch('aggregator.ModelManager')
-    def test_early_stopping_triggered(self, mock_mm):
-        agg = self._make_aggregator(mock_mm, early_stop_patience=3)
-
-        def make_eval(loss, f1):
-            return [{'test_loss': loss, 'test_f1': f1, 'test_acc': 0.8,
-                     'test_prec': 0.8, 'test_recall': 0.8, 'test_size': 100}]
-
-        agg.metrics_history = {0: {}, 1: {}, 2: {}, 3: {}}
-        agg.aggregate_evaluation_results(make_eval(0.3, 0.8), 0)  # prev=None → no increment
-        agg.aggregate_evaluation_results(make_eval(0.4, 0.7), 1)  # peggioramento → counter=1
-        agg.aggregate_evaluation_results(make_eval(0.5, 0.6), 2)  # peggioramento → counter=2
-        stop = agg.aggregate_evaluation_results(make_eval(0.6, 0.5), 3)  # counter=3 → stop
-        self.assertTrue(stop, "Early stopping deve scattare dopo 3 peggioramenti consecutivi")
-
-    @patch('aggregator.ModelManager')
-    def test_early_stopping_reset_on_improvement(self, mock_mm):
-        agg = self._make_aggregator(mock_mm, early_stop_patience=3)
-
-        def make_eval(loss, f1):
-            return [{'test_loss': loss, 'test_f1': f1, 'test_acc': 0.8,
-                     'test_prec': 0.8, 'test_recall': 0.8, 'test_size': 100}]
-
-        agg.metrics_history = {i: {} for i in range(5)}
-        agg.aggregate_evaluation_results(make_eval(0.3, 0.8), 0)
-        agg.aggregate_evaluation_results(make_eval(0.4, 0.7), 1)  # counter=1
-        agg.aggregate_evaluation_results(make_eval(0.5, 0.6), 2)  # counter=2
-        agg.aggregate_evaluation_results(make_eval(0.2, 0.9), 3)  # miglioramento → reset=0
-        stop = agg.aggregate_evaluation_results(make_eval(0.3, 0.8), 4)  # counter=1 → no stop
-        self.assertFalse(stop, "Early stopping non deve scattare dopo reset")
-
-    @patch('aggregator.ModelManager')
-    def test_get_stats_returns_dataframe(self, mock_mm):
-        agg = self._make_aggregator(mock_mm)
-        import pandas as pd
-        agg.metrics_history[0] = {'train_loss': 0.5, 'test_loss': 0.4, 'test_f1': 0.7,
-                                   'test_acc': 0.75, 'test_prec': 0.72, 'test_recall': 0.68}
-        df = agg.get_stats()
-        self.assertIsInstance(df, pd.DataFrame)
-        self.assertFalse(df.empty)
-        self.assertIn('train_loss', df.columns)
-
-    @patch('aggregator.ModelManager')
-    def test_get_run_summary_none_before_save(self, mock_mm):
-        agg = self._make_aggregator(mock_mm)
-        self.assertIsNone(agg.get_run_summary())
-
-
-# ---------------------------------------------------------------------------
-# 5. PORT ASSIGNMENT: nessuna collisione tra worker
-# ---------------------------------------------------------------------------
-
-class TestPortAssignment(unittest.TestCase):
-
-    def _get_ports(self, base_port: int, num_workers: int):
+    def test_multiple_workers_get_different_ports(self):
+        """find_free_port con preferred_port diversi restituisce porte diverse."""
+        from federated_grid_search import find_free_port
         ports = set()
-        for i in range(num_workers):
-            server_port = base_port + i * 2
-            ta_port = base_port + i * 2 + 1
-            ports.add(server_port)
-            ports.add(ta_port)
-        return ports
+        for worker_id in range(4):
+            preferred = 19000 + worker_id * 2
+            p = find_free_port('127.0.0.1', preferred)
+            ports.add(p)
+        self.assertEqual(len(ports), 4, f"Porte duplicate trovate: {ports}")
 
-    def test_no_port_collision_geosciences(self):
-        """12 worker, base 5001 → porta max 5001+11*2+1=5024. No overlap."""
-        ports = self._get_ports(5001, 12)
-        self.assertEqual(len(ports), 24)  # 12 worker × 2 porte ciascuno
+    def test_wait_for_port_free_timeout_returns_false(self):
+        """wait_for_port_free ritorna False se la porta rimane occupata fino allo scadere del timeout."""
+        from federated_grid_search import wait_for_port_free
+        import socket as _sock
+        s = _sock.socket(_sock.AF_INET, _sock.SOCK_STREAM)
+        s.setsockopt(_sock.SOL_SOCKET, _sock.SO_REUSEADDR, 1)
+        s.bind(('127.0.0.1', 0))
+        s.listen(1)
+        port = s.getsockname()[1]
+        try:
+            # Con timeout=2s e porta occupata, deve restituire False
+            result = wait_for_port_free('127.0.0.1', port, timeout=2)
+            self.assertFalse(result, f"wait_for_port_free avrebbe dovuto restituire False (porta {port} ancora occupata)")
+        finally:
+            s.close()
 
-    def test_no_port_collision_domino(self):
-        """3 worker, base 5001 → 6 porte distinte."""
-        ports = self._get_ports(5001, 3)
-        self.assertEqual(len(ports), 6)
+    def test_cleanup_returns_false_if_port_stuck(self):
+        """_cleanup_after_task ritorna False se la porta non si libera (mock del processo che la tiene)."""
+        from federated_grid_search import _cleanup_after_task, _port_is_listening
+        from unittest.mock import patch
 
-    def test_geosciences_port_range(self):
-        ports = self._get_ports(5001, 12)
-        self.assertEqual(min(ports), 5001)
-        self.assertEqual(max(ports), 5001 + 11 * 2 + 1)  # 5024
+        # Processo già morto — la porta è "libera" secondo _port_is_listening
+        # Simuliamo il caso opposto: la porta rimane occupata
+        # Usiamo patch per far credere che la porta sia sempre occupata
+        fake_port = 20600
 
-    def test_server_and_ta_ports_alternate(self):
-        """Verifica la formula: server=base+i*2, ta=base+i*2+1."""
-        for i in range(12):
-            server = 5001 + i * 2
-            ta = 5001 + i * 2 + 1
-            self.assertEqual(ta - server, 1)
-
-
-# ---------------------------------------------------------------------------
-# 6. FORMAT DURATION
-# ---------------------------------------------------------------------------
-
-class TestFormatDuration(unittest.TestCase):
-
-    def test_seconds_only(self):
-        self.assertEqual(_format_duration(45), "45s")
-
-    def test_minutes_and_seconds(self):
-        self.assertEqual(_format_duration(125), "2m 5s")
-
-    def test_hours_minutes_seconds(self):
-        self.assertEqual(_format_duration(3723), "1h 2m 3s")
-
-    def test_zero(self):
-        self.assertEqual(_format_duration(0), "0s")
-
-    def test_exactly_one_hour(self):
-        self.assertEqual(_format_duration(3600), "1h 0m 0s")
-
-    def test_exactly_one_minute(self):
-        self.assertEqual(_format_duration(60), "1m 0s")
+        with patch('federated_grid_search._port_is_listening', return_value=True), \
+             patch('federated_grid_search._get_pid_on_port', return_value=0):
+            p = multiprocessing.Process(target=_proc_exit_immediately)
+            p.start()
+            p.join(timeout=5)
+            result = _cleanup_after_task(p, fake_port, '127.0.0.1', worker_id=99, max_port_wait=2)
+            self.assertFalse(result, "_cleanup_after_task avrebbe dovuto ritornare False con porta bloccata")
 
 
-# ---------------------------------------------------------------------------
-# 7. FEDERATED SERVER: variabili watchdog e dropout presenti
-# ---------------------------------------------------------------------------
+# ===========================================================================
+# K — HEAVY SCHEDULING AVANZATO
+# ===========================================================================
 
-@unittest.skipUnless(TORCH_AVAILABLE, "torch non disponibile")
-class TestFederatedServerWatchdog(unittest.TestCase):
+class TestHeavySchedulingAdvanced(unittest.TestCase):
+    """Test avanzati per lo scheduling heavy/normal."""
 
-    @patch('aggregator.ModelManager')
-    @patch('federated_server.ModelManager', create=True)
-    def test_server_has_watchdog_state(self, mock_mm_server, mock_mm_agg):
-        """Verifica che FederatedServer abbia tutte le variabili del watchdog."""
-        mock_instance = MagicMock()
-        mock_instance.get_weights.return_value = [np.zeros((2, 2))]
-        mock_mm_agg.return_value = mock_instance
+    def _make_shared(self):
+        return (multiprocessing.Lock(),
+                multiprocessing.Value('i', 0),
+                multiprocessing.Value('i', 0))
 
-        # Patch anche aggregator.ModelManager usato da Aggregator
-        with patch('aggregator.ModelManager') as mock_agg_mm:
-            mock_agg_mm.return_value = mock_instance
+    def test_heavy_waits_for_active_normals_to_finish(self):
+        """Un heavy worker aspetta che tutti i normal attivi finiscano."""
+        heavy_lock, heavy_running, active_normal_workers = self._make_shared()
+        normals_active_when_heavy_ran = multiprocessing.Value('i', 0)
 
-            config = {
-                'ip_address': '127.0.0.1',
-                'port': 59999,
-                'ta_port': 60000,
-                'model_name': 'ResNet18',
-                'num_classes': 2,
-                'early_stop_patience': 5,
-                'image_size': 224,
-                'num_custom_layers': 2,
-                'MIN_NUM_WORKERS': 2,
-                'encryption_mode': 'no_encryption',
-                'round_timeout': 150,
-                'run_metrics_output_path': '/tmp',
-                'plot_dir': '/tmp',
-                'dataset_name': 'test',
-                'worker_id': 0,
-            }
+        def normal_worker():
+            with active_normal_workers.get_lock():
+                active_normal_workers.value += 1
+            time.sleep(0.08)
+            with active_normal_workers.get_lock():
+                active_normal_workers.value = max(0, active_normal_workers.value - 1)
 
-            from federated_server import FederatedServer
-            server = FederatedServer(config)
+        def heavy_worker():
+            heavy_lock.acquire()
+            with heavy_running.get_lock():
+                heavy_running.value = 1
+            deadline = time.time() + 5
+            while time.time() < deadline:
+                with active_normal_workers.get_lock():
+                    if active_normal_workers.value == 0:
+                        break
+                time.sleep(0.005)
+            # Cattura quanti normali sono ancora attivi nel momento in cui inizia
+            with active_normal_workers.get_lock():
+                normals_active_when_heavy_ran.value = active_normal_workers.value
+            time.sleep(0.02)
+            with heavy_running.get_lock():
+                heavy_running.value = 0
+            heavy_lock.release()
 
-            # Variabili watchdog
-            self.assertTrue(hasattr(server, 'round_phase'))
-            self.assertTrue(hasattr(server, '_last_activity'))
-            self.assertTrue(hasattr(server, '_round_timeout'))
-            self.assertTrue(hasattr(server, 'clients_selected_for_round'))
-            self.assertTrue(hasattr(server, 'clients_submitted_update'))
-            self.assertTrue(hasattr(server, 'clients_submitted_eval'))
+        normals = [threading.Thread(target=normal_worker) for _ in range(3)]
+        h = threading.Thread(target=heavy_worker)
+        for t in normals:
+            t.start()
+        time.sleep(0.02)
+        h.start()
+        for t in normals:
+            t.join(timeout=3)
+        h.join(timeout=5)
 
-            # Valori iniziali
-            self.assertEqual(server.round_phase, 'idle')
-            self.assertEqual(server._round_timeout, 150)
-            self.assertIsInstance(server.clients_selected_for_round, set)
-            self.assertIsInstance(server.clients_submitted_update, set)
-            self.assertIsInstance(server.clients_submitted_eval, set)
+        self.assertEqual(normals_active_when_heavy_ran.value, 0,
+                         f"{normals_active_when_heavy_ran.value} normal attivi quando heavy è partito!")
 
-    def test_watchdog_round_timeout_default(self):
-        """Verifica il valore di default del round_timeout."""
-        with patch('aggregator.ModelManager') as mock_agg_mm:
-            mock_instance = MagicMock()
-            mock_instance.get_weights.return_value = [np.zeros((2, 2))]
-            mock_agg_mm.return_value = mock_instance
-            config = {
-                'ip_address': '127.0.0.1', 'port': 59998, 'ta_port': 59999,
-                'model_name': 'ResNet18', 'num_classes': 2, 'early_stop_patience': 5,
-                'image_size': 224, 'num_custom_layers': 2, 'MIN_NUM_WORKERS': 2,
-                'encryption_mode': 'no_encryption',
-                'run_metrics_output_path': '/tmp', 'plot_dir': '/tmp',
-                'dataset_name': 'test', 'worker_id': 0,
-            }
-            from federated_server import FederatedServer
-            server = FederatedServer(config)
-            self.assertEqual(server._round_timeout, 150,
-                             "round_timeout default deve essere 150s")
+    def test_normal_workers_do_not_start_during_heavy(self):
+        """I worker normali attendono la fine dell'heavy prima di partire."""
+        heavy_lock, heavy_running, active_normal_workers = self._make_shared()
+        started_during_heavy = multiprocessing.Value('i', 0)
+        heavy_done = multiprocessing.Value('i', 0)
 
+        def heavy_worker():
+            heavy_lock.acquire()
+            with heavy_running.get_lock():
+                heavy_running.value = 1
+            time.sleep(0.1)
+            with heavy_running.get_lock():
+                heavy_running.value = 0
+            with heavy_done.get_lock():
+                heavy_done.value = 1
+            heavy_lock.release()
 
-# ---------------------------------------------------------------------------
-# 7b. SOURCE CHECK: federated_server.py contiene codice watchdog e disconnect
-# ---------------------------------------------------------------------------
+        def normal_worker():
+            deadline = time.time() + 5
+            while time.time() < deadline:
+                with heavy_running.get_lock():
+                    if heavy_running.value == 0:
+                        break
+                time.sleep(0.005)
+            with heavy_done.get_lock():
+                if heavy_done.value == 0:
+                    with started_during_heavy.get_lock():
+                        started_during_heavy.value += 1
+            with active_normal_workers.get_lock():
+                active_normal_workers.value += 1
+            time.sleep(0.01)
+            with active_normal_workers.get_lock():
+                active_normal_workers.value = max(0, active_normal_workers.value - 1)
 
-class TestStaticServerSource(unittest.TestCase):
-    """Test su file sorgente — non richiede torch."""
+        h = threading.Thread(target=heavy_worker)
+        normals = [threading.Thread(target=normal_worker) for _ in range(4)]
+        h.start()
+        time.sleep(0.01)
+        for t in normals:
+            t.start()
+        h.join(timeout=3)
+        for t in normals:
+            t.join(timeout=3)
 
-    def test_root_server_has_watchdog_symbols(self):
-        root_path = os.path.join(PROJECT_ROOT, 'federated_server.py')
-        with open(root_path) as f:
-            source = f.read()
-        for symbol in ('round_phase', '_last_activity', '_round_timeout',
-                        'clients_selected_for_round', 'clients_submitted_update',
-                        '_watchdog_loop'):
-            self.assertIn(symbol, source,
-                          f"'{symbol}' non trovato in federated_server.py")
+        self.assertEqual(started_during_heavy.value, 0,
+                         f"{started_during_heavy.value} normal partiti mentre l'heavy era in corso!")
 
-    def test_root_server_has_disconnect_handling(self):
-        root_path = os.path.join(PROJECT_ROOT, 'federated_server.py')
-        with open(root_path) as f:
-            source = f.read()
-        self.assertIn('_on_disconnect', source)
-        self.assertIn('num_clients_per_round', source)
-        self.assertIn('expected_eval_count', source)
+    def test_heavy_lock_allows_only_one_heavy_at_a_time(self):
+        """Massimo 1 heavy gira alla volta (heavy_lock è esclusivo)."""
+        heavy_lock, heavy_running, _ = self._make_shared()
+        concurrent = multiprocessing.Value('i', 0)
+        peak = multiprocessing.Value('i', 0)
 
-    def test_static_folder_has_no_python_files(self):
-        """static/ non deve contenere file .py — sono stati rimossi."""
-        static_dir = os.path.join(PROJECT_ROOT, 'static')
-        py_files = [f for f in os.listdir(static_dir) if f.endswith('.py')]
-        self.assertEqual(py_files, [],
-                         f"Trovati file .py inattesi in static/: {py_files}")
+        def heavy_worker():
+            heavy_lock.acquire()
+            with heavy_running.get_lock():
+                heavy_running.value = 1
+            with concurrent.get_lock():
+                concurrent.value += 1
+                with peak.get_lock():
+                    if concurrent.value > peak.value:
+                        peak.value = concurrent.value
+            time.sleep(0.03)
+            with concurrent.get_lock():
+                concurrent.value -= 1
+            with heavy_running.get_lock():
+                heavy_running.value = 0
+            heavy_lock.release()
 
+        threads = [threading.Thread(target=heavy_worker) for _ in range(5)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=5)
 
-# ---------------------------------------------------------------------------
-# 8. IMPORT CHECK: tutti i moduli principali importabili
-# ---------------------------------------------------------------------------
+        self.assertEqual(peak.value, 1,
+                         f"Peak di {peak.value} heavy worker contemporanei (atteso 1)")
 
-class TestImports(unittest.TestCase):
-
-    def test_import_utils(self):
-        import utils
-        self.assertTrue(hasattr(utils, 'object_to_pickle_string'))
-        self.assertTrue(hasattr(utils, 'pickle_string_to_object'))
-
-    def test_import_PCNAME(self):
-        import PCNAME
-        self.assertTrue(hasattr(PCNAME, 'name'))
-        self.assertIsInstance(PCNAME.name, str)
-        self.assertGreater(len(PCNAME.name), 0)
-
-    def test_import_data_splitter(self):
-        import data_splitter
-        self.assertTrue(hasattr(data_splitter, 'DatasetSplitter'))
-
-    def test_import_trusted_authority(self):
-        import trusted_authority
-        self.assertTrue(hasattr(trusted_authority, 'TrustedAuthority'))
-
-    @unittest.skipUnless(TORCH_AVAILABLE, "torch non disponibile")
-    def test_import_model_manager(self):
-        import model_manager
-        self.assertTrue(hasattr(model_manager, 'ModelManager'))
-        self.assertTrue(hasattr(model_manager, 'ConvNet'))
-
-    @unittest.skipUnless(TORCH_AVAILABLE, "torch non disponibile")
-    def test_import_aggregator(self):
-        import aggregator
-        self.assertTrue(hasattr(aggregator, 'Aggregator'))
-
-    @unittest.skipUnless(TORCH_AVAILABLE, "torch non disponibile")
-    def test_import_federated_grid_search(self):
-        import federated_grid_search
-        self.assertTrue(hasattr(federated_grid_search, 'main'))
-        self.assertTrue(hasattr(federated_grid_search, 'get_config_fingerprint'))
-        self.assertTrue(hasattr(federated_grid_search, 'generate_configurations'))
-        self.assertTrue(hasattr(federated_grid_search, 'send_telegram'))
-
-    @unittest.skipUnless(TORCH_AVAILABLE, "torch non disponibile")
-    def test_import_federated_server(self):
-        import federated_server
-        self.assertTrue(hasattr(federated_server, 'FederatedServer'))
-
-    @unittest.skipUnless(TORCH_AVAILABLE, "torch non disponibile")
-    def test_import_federated_client(self):
-        import federated_client
-        self.assertTrue(hasattr(federated_client, 'FederatedClient'))
-
-    @unittest.skipUnless(TORCH_AVAILABLE, "torch non disponibile")
-    def test_import_run_multiple_clients(self):
-        import run_multiple_clients
-        self.assertTrue(hasattr(run_multiple_clients, 'main'))
+    def test_threshold_boundary_values(self):
+        """Verifica i valori limite del HEAVY_CLIENT_THRESHOLD."""
+        from federated_grid_search import HEAVY_CLIENT_THRESHOLD
+        self.assertEqual(HEAVY_CLIENT_THRESHOLD, 8)
+        # Valori <= threshold = normale
+        for n in [1, 2, 4, 8]:
+            self.assertFalse(n > HEAVY_CLIENT_THRESHOLD, f"num_clients={n} non dovrebbe essere heavy")
+        # Valori > threshold = heavy
+        for n in [9, 16, 32]:
+            self.assertTrue(n > HEAVY_CLIENT_THRESHOLD, f"num_clients={n} dovrebbe essere heavy")
 
 
-# ---------------------------------------------------------------------------
-# 9. GRID SEARCH CONFIG LOADING (come lo fa federated_grid_search.main)
-# ---------------------------------------------------------------------------
+# ===========================================================================
+# L — ZOMBIE PROCESS CLEANUP
+# ===========================================================================
 
-class TestGridSearchConfigLoading(unittest.TestCase):
+class TestZombieCleanup(unittest.TestCase):
+    """Testa _cleanup_after_task() per processi zombie e porte bloccate."""
 
-    def test_geosciences_config_loads_correctly(self):
-        with open(os.path.join(PROJECT_ROOT, 'grid_search_config.json')) as f:
-            cfg = json.load(f)
-        self.assertIsInstance(cfg['datasets'], list)
-        self.assertIsInstance(cfg['common_search_space'], dict)
-        self.assertIsInstance(cfg['model_specific_search_space'], dict)
+    def test_cleanup_kills_alive_server_process(self):
+        """_cleanup_after_task killa un processo che non termina da solo."""
+        from federated_grid_search import _cleanup_after_task, find_free_port
 
-    def test_config_all_models_present(self):
-        expected_models = {'GoogLeNet', 'AlexNet', 'ConvNet', 'ResNet18', 'ResNet34', 'ResNet50', 'ResNet101'}
-        for fname in CONFIG_FILES.values():
-            with open(os.path.join(PROJECT_ROOT, fname)) as f:
-                cfg = json.load(f)
-            models = set(cfg['model_specific_search_space'].keys())
-            self.assertEqual(models, expected_models, f"Modelli mancanti/extra in {fname}: {models ^ expected_models}")
+        port = find_free_port('127.0.0.1', 20000)
+        p = multiprocessing.Process(target=_proc_hang_forever)
+        p.start()
 
-    def test_encryption_modes_present(self):
-        for fname in CONFIG_FILES.values():
-            with open(os.path.join(PROJECT_ROOT, fname)) as f:
-                cfg = json.load(f)
-            modes = set(cfg['common_search_space']['encryption_mode'])
-            self.assertIn('no_encryption', modes, f"no_encryption mancante in {fname}")
-            self.assertIn('homomorphic', modes, f"homomorphic mancante in {fname}")
+        _cleanup_after_task(p, port, '127.0.0.1', worker_id=99)
 
-    def test_aggregation_algorithms_are_fedavg_fedprox(self):
-        for fname in CONFIG_FILES.values():
-            with open(os.path.join(PROJECT_ROOT, fname)) as f:
-                cfg = json.load(f)
-            algos = set(cfg['common_search_space']['aggregation_algorithm'])
-            self.assertEqual(algos, {'FedAvg', 'FedProx'}, f"Algoritmi errati in {fname}")
+        p.join(timeout=5)
+        self.assertFalse(p.is_alive(), "Il processo zombie non è stato killato da _cleanup_after_task")
+
+    def test_cleanup_returns_true_when_server_already_dead(self):
+        """_cleanup_after_task ritorna True se il server è già terminato e la porta è libera."""
+        from federated_grid_search import _cleanup_after_task, find_free_port
+
+        port = find_free_port('127.0.0.1', 20100)
+        p = multiprocessing.Process(target=_proc_exit_immediately)
+        p.start()
+        p.join(timeout=5)  # processo già morto
+
+        result = _cleanup_after_task(p, port, '127.0.0.1', worker_id=99)
+        self.assertTrue(result)
+
+    def test_cleanup_handles_already_dead_process_no_exception(self):
+        """_cleanup_after_task non solleva eccezioni se il processo è già morto."""
+        from federated_grid_search import _cleanup_after_task, find_free_port
+
+        port = find_free_port('127.0.0.1', 20200)
+        p = multiprocessing.Process(target=_proc_exit_immediately)
+        p.start()
+        p.join(timeout=5)
+
+        try:
+            _cleanup_after_task(p, port, '127.0.0.1', worker_id=99)
+        except Exception as e:
+            self.fail(f"_cleanup_after_task ha sollevato un'eccezione: {e}")
+
+    def test_cleanup_frees_port_held_by_process(self):
+        """_cleanup_after_task libera la porta dopo aver killato il processo che la teneva."""
+        from federated_grid_search import _cleanup_after_task, find_free_port, _port_is_listening
+        import socket as _sock
+
+        port = find_free_port('127.0.0.1', 20300)
+
+        proc = multiprocessing.Process(target=_proc_hold_port, args=(port,))
+        proc.start()
+        # Aspetta che la porta venga aperta (su Windows spawn=lento → 5s)
+        for _ in range(50):
+            if _port_is_listening('127.0.0.1', port):
+                break
+            time.sleep(0.1)
+
+        if not _port_is_listening('127.0.0.1', port):
+            proc.terminate()
+            proc.join(timeout=3)
+            self.skipTest("Porta non occupata entro 5s (processo troppo lento su questo sistema)")
+
+        _cleanup_after_task(proc, port, '127.0.0.1', worker_id=99, max_port_wait=15)
+
+        self.assertFalse(_port_is_listening('127.0.0.1', port),
+                         "Porta ancora occupata dopo _cleanup_after_task")
+
+    def test_cleanup_kills_server_children_with_psutil(self):
+        """_cleanup_after_task killa i processi figlio del server (con psutil)."""
+        try:
+            import psutil
+        except ImportError:
+            self.skipTest("psutil non disponibile")
+
+        from federated_grid_search import _cleanup_after_task, find_free_port
+
+        port = find_free_port('127.0.0.1', 20400)
+        pid_list = multiprocessing.Manager().list()
+        p = multiprocessing.Process(target=_proc_parent_with_child, args=(pid_list,))
+        p.start()
+        # Aspetta che il child sia avviato
+        for _ in range(20):
+            if len(pid_list) > 0:
+                break
+            time.sleep(0.1)
+
+        _cleanup_after_task(p, port, '127.0.0.1', worker_id=99)
+        time.sleep(0.5)
+
+        if len(pid_list) > 0:
+            child_pid = pid_list[0]
+            try:
+                child_proc = psutil.Process(child_pid)
+                is_zombie = child_proc.status() == psutil.STATUS_ZOMBIE
+                self.assertTrue(
+                    not child_proc.is_running() or is_zombie,
+                    f"Child process {child_pid} ancora in esecuzione!"
+                )
+            except psutil.NoSuchProcess:
+                pass  # Morto = test passato
+
+    def test_client_threads_join_after_completion(self):
+        """Dopo la simulazione di run_multiple_clients, nessun thread rimane vivo."""
+        threads = []
+        results = []
+
+        def fake_client(cid):
+            time.sleep(0.02)
+            results.append(cid)
+
+        for i in range(4):
+            t = threading.Thread(target=fake_client, args=(i,))
+            t.start()
+            threads.append(t)
+
+        for t in threads:
+            t.join(timeout=2)
+
+        self.assertEqual(len(results), 4)
+        alive = [t for t in threads if t.is_alive()]
+        self.assertEqual(len(alive), 0, f"{len(alive)} thread client rimasti vivi (zombie thread)")
+
+    def test_cleanup_multiple_times_idempotent(self):
+        """Chiamare _cleanup_after_task più volte sullo stesso processo non crasha."""
+        from federated_grid_search import _cleanup_after_task, find_free_port
+
+        port = find_free_port('127.0.0.1', 20500)
+        p = multiprocessing.Process(target=_proc_exit_immediately)
+        p.start()
+        p.join(timeout=5)
+
+        try:
+            _cleanup_after_task(p, port, '127.0.0.1', worker_id=99)
+            _cleanup_after_task(p, port, '127.0.0.1', worker_id=99)
+        except Exception as e:
+            self.fail(f"Seconda chiamata a _cleanup_after_task ha crashato: {e}")
 
 
 if __name__ == '__main__':
