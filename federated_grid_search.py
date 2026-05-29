@@ -930,7 +930,7 @@ def main():
                                  if ds['path'] in required_paths]
         download_config = {**base_grid_config, 'datasets': datasets_to_download}
         from dataset_manager import check_and_download_datasets_parallel
-        check_and_download_datasets_parallel(download_config, max_parallel=1)
+        check_and_download_datasets_parallel(download_config, max_parallel=4)
 
     for hyper_config in pending_configs:
         task_queue.put(hyper_config)

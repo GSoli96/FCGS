@@ -79,7 +79,7 @@ def _download_folder(repo_id: str, token: str, hf_path: str) -> bool:
             local_dir=str(_SCRIPT_DIR),
             allow_patterns=patterns,
             ignore_patterns=['*.gitattributes'],
-            max_workers=1,
+            max_workers=2,
         )
         return _dataset_exists(hf_path)
     except Exception as e:
