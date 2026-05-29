@@ -191,3 +191,6 @@ logs_errors_warnings.txt
 # Token HuggingFace — mai committare
 .hf_token
 .hf_token_write
+
+# Comandi PC con token — mai committare
+Comandi_pc.txt
