@@ -531,6 +531,7 @@ def run_grid_search_worker(
 ) -> None:
     print(f"--- Starting Grid Search Worker {worker_id} ---")
     pc_name = PCNAME.name
+    logger = logging.getLogger(f"FCGS-Worker-{worker_id}-{pc_name}")
 
     # Distribuisce i worker sui GPU disponibili (escludendo gpu_blacklist).
     # Ogni worker process ha il proprio spazio di ambiente, quindi impostare
