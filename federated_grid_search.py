@@ -88,8 +88,7 @@ def _setup_main_logger(pc_name: str, base_log_path: str) -> logging.Logger:
         logger.handlers.clear()
     log_dir = os.path.join(_PROJECT_ROOT, base_log_path, f'log_{pc_name}')
     os.makedirs(log_dir, exist_ok=True)
-    timestr = time.strftime('%Y%m%d_%H%M%S')
-    fh = logging.FileHandler(os.path.join(log_dir, f'main_{timestr}.log'), encoding='utf-8')
+    fh = logging.FileHandler(os.path.join(log_dir, 'main.log'), mode='w', encoding='utf-8')
     fh.setLevel(logging.INFO)
     ch = logging.StreamHandler()
     ch.setLevel(logging.INFO)
@@ -638,8 +637,9 @@ def run_grid_search_worker(
             # riflette i client effettivi dopo I/O (non una stima dry-run che ignora
             # fallimenti di copia su Windows sotto carico).
             _dataset_abs = os.path.join(str(_PROJECT_ROOT), config['dataset_path'])
-            if not os.path.isdir(_dataset_abs):
-                logger.warning(f"[W{worker_id}] Dataset non trovato: {_dataset_abs}. "
+            from dataset_manager import _dataset_exists as _has_images
+            if not os.path.isdir(_dataset_abs) or not _has_images(_dataset_abs):
+                logger.warning(f"[W{worker_id}] Dataset assente o vuoto: {_dataset_abs}. "
                                f"Skipping {dataset_name}|{model_name}.")
                 _safe_rmtree(worker_splitting_dir)
                 continue
@@ -819,6 +819,9 @@ def main():
     os.makedirs(os.path.join(_PROJECT_ROOT, _base_plot, f'plots_{pc_name}'), exist_ok=True)
     os.makedirs(os.path.join(_PROJECT_ROOT, _base_split, f'split_{pc_name}'), exist_ok=True)
 
+    # Logger principale creato subito — usato anche per il download dei dataset.
+    _main_logger = _setup_main_logger(pc_name, _base_log)
+
     shared_csv_path = os.path.join(base_csv_path, f'federated_grid_search_results_{pc_name}.csv')
 
     executed_fingerprints: Set[FrozenSet[Tuple[str, str]]] = set()
@@ -930,7 +933,23 @@ def main():
                                  if ds['path'] in required_paths]
         download_config = {**base_grid_config, 'datasets': datasets_to_download}
         from dataset_manager import check_and_download_datasets_parallel
-        check_and_download_datasets_parallel(download_config, max_parallel=4)
+        import time as _time
+        download_ok = check_and_download_datasets_parallel(
+            download_config, max_parallel=2, logger=_main_logger)
+        if not download_ok:
+            _main_logger.warning("[FCGS] Download incompleto al primo tentativo. Riprovo tra 60s...")
+            _time.sleep(60)
+            download_ok = check_and_download_datasets_parallel(
+                download_config, max_parallel=2, logger=_main_logger)
+        if not download_ok:
+            msg = "Download dataset fallito dopo tutti i tentativi. Processo terminato."
+            _main_logger.error(f"[FCGS] ERRORE FATALE: {msg}")
+            _tok = base_grid_config.get('telegram_bot_token', '')
+            _cid = base_grid_config.get('telegram_chat_id', '')
+            send_telegram(_tok, _cid,
+                          f"<b>⚠️ FCGS ERRORE — {pc_name}</b>\n{msg}",
+                          logger=_main_logger)
+            sys.exit(1)
 
     for hyper_config in pending_configs:
         task_queue.put(hyper_config)
@@ -1000,8 +1019,6 @@ def main():
     heavy_running = multiprocessing.Value('i', 0)
     active_normal_workers = multiprocessing.Value('i', 0)
     start_time = time.time()
-
-    _main_logger = _setup_main_logger(pc_name, _base_log)
 
     num_workers = _compute_num_workers(base_grid_config)
 

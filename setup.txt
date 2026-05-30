@@ -4,7 +4,11 @@ Windows (MSIDomino11, MSIDomino12, MSI)
   python -m venv venv
 
   :: 2. Attiva il venv
-  venv\Scripts\activate
+    py -3.11 -m venv venv --clear
+  venv\Scripts\python -m pip install --upgrade pip
+  venv\Scripts\pip install -r requirements_windows.txt
+  venv\Scripts\pip install torch torchvision --index-url https://download.pytorch.org/whl/cu126
+  venv\Scripts\python federated_grid_search.py
 
   :: 3. Aggiorna pip
   python -m pip install --upgrade pip

@@ -8,6 +8,7 @@ Se mancano, li scarica dal repository HF privato (in parallelo).
 Token read:  variabile d'ambiente HF_TOKEN oppure file .hf_token
 Token write: variabile d'ambiente HF_TOKEN_WRITE oppure file .hf_token_write
 """
+import logging
 import os
 from pathlib import Path
 from typing import List, Dict, Optional
@@ -17,6 +18,8 @@ _SCRIPT_DIR = Path(__file__).parent
 _TOKEN_FILE = _SCRIPT_DIR / '.hf_token'
 _TOKEN_WRITE_FILE = _SCRIPT_DIR / '.hf_token_write'
 DEFAULT_REPO_ID = 'Siando/fcgs-datasets'
+
+_IMAGE_EXTENSIONS = {'.jpg', '.jpeg', '.png', '.bmp', '.gif', '.tiff', '.webp'}
 
 
 def _get_hf_token() -> Optional[str]:
@@ -37,76 +40,106 @@ def _get_hf_token_write() -> Optional[str]:
     return _get_hf_token()
 
 
-_IMAGE_EXTENSIONS = {'.jpg', '.jpeg', '.png', '.bmp', '.gif', '.tiff', '.webp'}
+def _log(msg: str, logger: Optional[logging.Logger] = None, level: str = 'info') -> None:
+    print(msg)
+    if logger:
+        getattr(logger, level)(msg)
 
 
-def _dataset_exists(path: str) -> bool:
-    """Returns True only if the dataset directory contains actual image files.
-
-    Checks one level deep (dataset_root/class_name/image.jpg) to catch the case
-    where a partial HF download created class subdirectories but left them empty.
-    """
+def _count_images(path: str) -> int:
+    """Conta le immagini in un dataset (un livello di profondità: root/classe/img)."""
     p = Path(path) if Path(path).is_absolute() else _SCRIPT_DIR / path
     if not p.exists():
-        return False
+        return 0
+    count = 0
     try:
         for item in p.iterdir():
             if item.is_dir():
-                for f in item.iterdir():
-                    if f.is_file() and f.suffix.lower() in _IMAGE_EXTENSIONS:
-                        return True
+                count += sum(1 for f in item.iterdir()
+                             if f.is_file() and f.suffix.lower() in _IMAGE_EXTENSIONS)
             elif item.is_file() and item.suffix.lower() in _IMAGE_EXTENSIONS:
-                return True
-        return False
+                count += 1
     except PermissionError:
-        return False
+        pass
+    return count
 
 
-def _find_missing(datasets: List[Dict]) -> List[Dict]:
-    return [ds for ds in datasets if not _dataset_exists(ds['path'])]
+def _dataset_exists(path: str) -> bool:
+    """Returns True only if the dataset directory contains actual image files."""
+    return _count_images(path) > 0
 
 
-def _download_folder(repo_id: str, token: str, hf_path: str) -> bool:
-    """Scarica una singola cartella del dataset dal repo HF."""
+def _find_missing(datasets: List[Dict], logger: Optional[logging.Logger] = None) -> List[Dict]:
+    """Trova dataset mancanti o incompleti (< 90% del num_images atteso)."""
+    missing = []
+    for ds in datasets:
+        actual = _count_images(ds['path'])
+        expected = ds.get('num_images', 0)
+        if actual == 0:
+            _log(f"  [DatasetManager] {ds['name']}: ASSENTE (0 immagini trovate)", logger)
+            missing.append(ds)
+        elif expected > 0 and actual < expected * 0.9:
+            _log(f"  [DatasetManager] {ds['name']}: INCOMPLETO ({actual}/{expected} immagini, "
+                 f"{actual/expected*100:.1f}%) — da ri-scaricare", logger, 'warning')
+            missing.append(ds)
+        else:
+            _log(f"  [DatasetManager] {ds['name']}: OK ({actual} immagini)", logger)
+    return missing
+
+
+def _download_folder(repo_id: str, token: str, hf_path: str,
+                     max_retries: int = 3, logger: Optional[logging.Logger] = None) -> bool:
+    """Scarica una singola cartella del dataset dal repo HF, con retry su errore."""
+    import time
     from huggingface_hub import snapshot_download
     hf_path = hf_path.replace('\\', '/')
     patterns = [f"{hf_path}/*", f"{hf_path}/**/*"]
-    try:
-        snapshot_download(
-            repo_id=repo_id,
-            repo_type='dataset',
-            token=token,
-            local_dir=str(_SCRIPT_DIR),
-            allow_patterns=patterns,
-            ignore_patterns=['*.gitattributes'],
-            max_workers=2,
-        )
-        return _dataset_exists(hf_path)
-    except Exception as e:
-        print(f"  [DatasetManager] ERRORE download '{hf_path}': {e}")
-        return False
+    for attempt in range(1, max_retries + 1):
+        try:
+            snapshot_download(
+                repo_id=repo_id,
+                repo_type='dataset',
+                token=token,
+                local_dir=str(_SCRIPT_DIR),
+                allow_patterns=patterns,
+                ignore_patterns=['*.gitattributes'],
+                max_workers=1,
+            )
+            if _dataset_exists(hf_path):
+                return True
+            _log(f"  [DatasetManager] '{hf_path}': download completato ma nessuna immagine "
+                 f"(tentativo {attempt}/{max_retries}).", logger, 'warning')
+        except Exception as e:
+            _log(f"  [DatasetManager] ERRORE download '{hf_path}' "
+                 f"(tentativo {attempt}/{max_retries}): {e}", logger, 'error')
+        if attempt < max_retries:
+            wait = 30 * attempt
+            _log(f"  [DatasetManager] Attendo {wait}s prima di riprovare...", logger)
+            time.sleep(wait)
+    return False
 
 
-def _download_common(config: Dict, parallel: bool = True, max_parallel: int = 4) -> bool:
-    """Logica comune: trova i dataset mancanti e li scarica (sequenziale o parallelo)."""
+def _download_common(config: Dict, parallel: bool = True, max_parallel: int = 4,
+                     logger: Optional[logging.Logger] = None) -> bool:
+    """Logica comune: trova i dataset mancanti/incompleti e li scarica."""
     datasets = config.get('datasets', [])
     if not datasets:
         return True
 
-    missing = _find_missing(datasets)
+    _log("[DatasetManager] Verifica dataset locali...", logger)
+    missing = _find_missing(datasets, logger)
     if not missing:
-        print(f"[DatasetManager] Tutti i {len(datasets)} dataset presenti localmente. Nessun download necessario.")
+        _log(f"[DatasetManager] Tutti i {len(datasets)} dataset presenti e completi.", logger)
         return True
 
-    print(f"[DatasetManager] Dataset mancanti ({len(missing)}/{len(datasets)}):")
+    _log(f"[DatasetManager] Dataset da scaricare ({len(missing)}/{len(datasets)}):", logger, 'warning')
     for ds in missing:
-        print(f"  - {ds['name']}  ({ds['path']})")
+        _log(f"  - {ds['name']} ({ds['path']})", logger, 'warning')
 
     token = _get_hf_token()
     if not token:
-        print("[DatasetManager] ATTENZIONE: token HuggingFace non trovato.")
-        print(f"  Imposta HF_TOKEN o crea il file {_TOKEN_FILE.name}")
-        print("  I dataset mancanti non verranno scaricati — la grid search potrebbe fallire.")
+        _log("[DatasetManager] ATTENZIONE: token HuggingFace non trovato. "
+             f"Imposta HF_TOKEN o crea {_TOKEN_FILE.name}", logger, 'error')
         return False
 
     repo_id = config.get('hf_repo_id', DEFAULT_REPO_ID)
@@ -114,46 +147,48 @@ def _download_common(config: Dict, parallel: bool = True, max_parallel: int = 4)
 
     if parallel and len(missing) > 1:
         workers = min(max_parallel, len(missing))
-        print(f"[DatasetManager] Scarico {len(missing)} dataset da {repo_id} ({workers} in parallelo)...")
+        _log(f"[DatasetManager] Scarico {len(missing)} dataset da {repo_id} "
+             f"({workers} in parallelo)...", logger)
         with ThreadPoolExecutor(max_workers=workers) as executor:
-            futures = {executor.submit(_download_folder, repo_id, token, ds['path']): ds for ds in missing}
+            futures = {executor.submit(_download_folder, repo_id, token, ds['path'], 3, logger): ds
+                       for ds in missing}
             for future in as_completed(futures):
                 ds = futures[future]
                 try:
                     ok = future.result()
                 except Exception as exc:
                     ok = False
-                    print(f"    [FAIL] {ds['name']} exception: {exc}")
+                    _log(f"    [FAIL] {ds['name']} exception: {exc}", logger, 'error')
                 if ok:
-                    print(f"    [OK] {ds['name']} scaricato.")
+                    _log(f"    [OK] {ds['name']} scaricato.", logger)
                 else:
-                    print(f"    [FAIL] {ds['name']} FALLITO.")
+                    _log(f"    [FAIL] {ds['name']} FALLITO.", logger, 'error')
                     failed.append(ds['name'])
     else:
-        print(f"[DatasetManager] Scarico da {repo_id} ...")
+        _log(f"[DatasetManager] Scarico da {repo_id} (sequenziale)...", logger)
         for ds in missing:
-            print(f"  -> {ds['name']} ...")
-            ok = _download_folder(repo_id, token, ds['path'])
+            _log(f"  -> {ds['name']} ...", logger)
+            ok = _download_folder(repo_id, token, ds['path'], 3, logger)
             if ok:
-                print(f"    [OK] {ds['name']} scaricato.")
+                _log(f"    [OK] {ds['name']} scaricato.", logger)
             else:
-                print(f"    [FAIL] {ds['name']} FALLITO.")
+                _log(f"    [FAIL] {ds['name']} FALLITO.", logger, 'error')
                 failed.append(ds['name'])
 
     if failed:
-        print(f"[DatasetManager] Download fallito per: {failed}")
-        print("  La grid search continuerà ma salterà i dataset mancanti.")
+        _log(f"[DatasetManager] Download fallito per: {failed}", logger, 'error')
         return False
 
-    print(f"[DatasetManager] Tutti i dataset scaricati correttamente.")
+    _log("[DatasetManager] Tutti i dataset scaricati correttamente.", logger)
     return True
 
 
-def check_and_download_datasets(config: Dict) -> bool:
+def check_and_download_datasets(config: Dict, logger: Optional[logging.Logger] = None) -> bool:
     """Controlla e scarica i dataset mancanti (sequenziale, retrocompatibile)."""
-    return _download_common(config, parallel=False)
+    return _download_common(config, parallel=False, logger=logger)
 
 
-def check_and_download_datasets_parallel(config: Dict, max_parallel: int = 4) -> bool:
-    """Controlla e scarica i dataset mancanti in parallelo (max_parallel dataset contemporanei)."""
-    return _download_common(config, parallel=True, max_parallel=max_parallel)
+def check_and_download_datasets_parallel(config: Dict, max_parallel: int = 4,
+                                         logger: Optional[logging.Logger] = None) -> bool:
+    """Controlla e scarica i dataset mancanti/incompleti in parallelo."""
+    return _download_common(config, parallel=True, max_parallel=max_parallel, logger=logger)

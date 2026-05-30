@@ -85,3 +85,131 @@
 | No clients remaining round X | Media | Siando, MSIDomino12 | Conseguenza di training_size=0 | FIXATO indirettamente |
 | Namespace connection error | 49x | Siando, geosciences | emit su socket già disconnesso in `_on_stop_and_eval` | FIXATO (1.4) |
 | Missing dataset files | Risolto | MSIDomino11 | Path HF erano sbagliati | RISOLTO |
+
+---
+
+## PIANO OPERATIVO — Avvio esperimenti su tutti i PC (sessione 2026-05-31)
+
+### Stato generale
+
+| PC | Stato | CSV prodotti | Note |
+|---|---|---|---|
+| Siando | ✅ IN ESECUZIONE | 201 (ultimo 31/05 00:33) | 120/16848 al heartbeat 23:31. Lento, ETA 557h |
+| MSI | ❌ BLOCCATO | 0 | 2 istanze in conflitto (PID 12160 + 22876). Da killare e riavviare |
+| MSIDomino12 | ⏳ DA AVVIARE | — | In attesa che MSI funzioni |
+| MSIDomino11 | ⏳ DA AVVIARE | — | In attesa che Domino12 sia avviato |
+
+---
+
+### Fase 1 — Download dataset su Siando ✅ COMPLETATA
+
+- [x] `dataset_slices_sorted_augmented` scaricato
+- [x] `dataset_multy_sorted_T1_augmented` scaricato
+- [x] `dataset_multy_sorted_T2_augmented` scaricato
+- [x] `dataset_multy_sorted_augmented` scaricato
+- [x] `dataset_ISIC2` scaricato (con 1 retry per errore tqdm)
+
+---
+
+### Fase 2 — Verifica strutture locali [ ] DA FARE
+
+Per ogni dataset nella config Siando (22 totali), verificare:
+- Path esiste e contiene immagini
+- Numero sottocartelle == num_classes
+- Nessuna cartella anomala (train/, test/, README/)
+
+Dataset con attenzione particolare:
+- `dataset_multy_sorted_augmented` (3 classi) — scaricare era incompleto, verificare ora
+- `dataset_multy_sorted_T1_augmented` (3 classi) — mancava classe_2
+- `dataset_multy_sorted_T2_augmented` (3 classi) — mancava classe_2
+- `dataset_ISIC2` (2 classi Benign/Malignant)
+- `dataset_slices_sorted_T2` (2 classi, class_1/T2/ già fixato localmente)
+
+**Regola**: se sottocartelle != num_classes → STOP + Telegram + attendi risposta utente.
+
+---
+
+### Fase 3 — Test dataset splitting [ ] DA FARE
+
+Per ogni dataset verificato OK, test split di prova con num_clients=2:
+```python
+from data_splitter import compute_effective_clients
+effective = compute_effective_clients(source_images_dir=dataset_abs_path, num_clients=2)
+# Se effective >= 2 → OK; se effective == 0 → PROBLEMA
+```
+
+---
+
+### Fase 4 — Fix strutture (se necessario) [PARZIALE]
+
+- [x] `dataset_slices_sorted_T2/class_1/T2/*.png` → `class_1/` (già fatto localmente)
+- [ ] Upload fix `dataset_slices_sorted_T2` su HuggingFace (token write da `.hf_token_write`)
+
+---
+
+### Fase 5 — Avvio Siando ✅ COMPLETATA
+
+- [x] Processo avviato (30/05 19:31)
+- [x] Telegram "FCGS avviata — Siando" ricevuto
+- [x] 201 CSV prodotti, heartbeat ricevuto
+
+---
+
+### Fase 6 — Fix e riavvio MSI ❌ DA FARE (priorità alta)
+
+Problema attuale: 2 istanze Python in conflitto, 0 CSV, `infrastruttura.json` vuoto su MSI.
+
+- [ ] **6a** — Killare entrambe le istanze su MSI:
+  ```
+  ssh msi "taskkill /F /PID 12160 /PID 22876"
+  ```
+- [ ] **6b** — Verificare che `infrastruttura.json` su MSI sia valido (attualmente 0 byte → copiarlo da qui)
+- [ ] **6c** — Riavviare con una sola istanza venv:
+  ```
+  ssh msi "powershell -Command Start-Process -FilePath 'C:\Users\giand\Desktop\prog\FCGS\venv\Scripts\python.exe' -ArgumentList 'federated_grid_search.py' -WorkingDirectory 'C:\Users\giand\Desktop\prog\FCGS' -WindowStyle Hidden"
+  ```
+- [ ] **6d** — Verificare che il log `log/log_MSI/main_*.log` venga creato (entro 5 min)
+- [ ] **6e** — Verificare primo heartbeat Telegram da MSI (dopo 4h)
+
+---
+
+### Fase 7 — Avvio Domino12 ⏳ DA FARE (dopo MSI OK)
+
+Prerequisito: MSI ha iniziato gli esperimenti (log mostra avvio worker).
+
+```
+ssh domino12 "powershell -Command Start-Process -FilePath 'C:\Users\dastl\Desktop\Giando\FCGS\venv\Scripts\python.exe' -ArgumentList 'federated_grid_search.py' -WorkingDirectory 'C:\Users\dastl\Desktop\Giando\FCGS' -WindowStyle Hidden"
+```
+
+- [ ] Verificare log `log/log_MSIDomino12/main_*.log` creato
+- [ ] Verificare heartbeat Telegram da Domino12
+
+---
+
+### Fase 8 — Avvio Domino11 ⏳ DA FARE (dopo Domino12 OK)
+
+```
+ssh domino11 "powershell -Command Start-Process -FilePath 'C:\Users\domin\Desktop\prog\FCGS\venv\Scripts\python.exe' -ArgumentList 'federated_grid_search.py' -WorkingDirectory 'C:\Users\domin\Desktop\prog\FCGS' -WindowStyle Hidden"
+```
+
+- [ ] Verificare log `log/log_MSIDomino11/main_*.log` creato
+- [ ] Verificare heartbeat Telegram da Domino11
+
+---
+
+### Regole di sicurezza
+
+- Dataset classi diverse da attese → STOP + Telegram + attendi risposta
+- SSH fallisce → STOP + Telegram + attendi risposta
+- Split effective=0 → STOP + Telegram + attendi risposta
+- Processo crasha → Telegram alert ma continua con altri PC
+- Ogni azione rilevante → log console + Telegram
+
+---
+
+### Verifica end-to-end
+
+1. Log `main_*.log` di ogni PC mostra "FCGS avviata" + worker attivi
+2. Nessun errore FATAL nei log
+3. Telegram heartbeat ogni 4h ricevuti
+4. CSV in `csv/csv_<PC>/` vengono popolati
