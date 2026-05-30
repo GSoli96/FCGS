@@ -40,6 +40,7 @@ bidict==0.23.1
 
 # --- HuggingFace (download automatico dataset) ---
 huggingface_hub==0.34.4
+hf_xet==1.5.0
 
 # --- Monitoring ---
 psutil==6.0.0
