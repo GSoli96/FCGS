@@ -153,7 +153,13 @@ def _download_folder(repo_id: str, token: str, hf_path: str,
 def _download_common(config: Dict, parallel: bool = True, max_parallel: int = 4,
                      logger: Optional[logging.Logger] = None) -> bool:
     """Logica comune: trova i dataset mancanti/incompleti e li scarica."""
+    import platform
     datasets = config.get('datasets', [])
+    # On Windows, concurrent HF snapshot_download calls collide on lock/cache files
+    # producing errno 22 (Invalid argument). Force sequential to avoid this.
+    if platform.system() == 'Windows' and parallel and max_parallel > 1:
+        _log("[DatasetManager] Windows rilevato: download sequenziale forzato (parallel=1 per evitare errno 22 su lock HF).", logger, 'warning')
+        parallel = False
     if not datasets:
         return True
 

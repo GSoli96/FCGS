@@ -6,10 +6,8 @@
   "telegram_chat_id": "139781098",
   "notification_interval": 100,
   "heartbeat_interval_hours": 4,
-  "gpu_blacklist": [
-    1
-  ],
-  "num_parallel_executions": 8,
+  "gpu_blacklist": [],
+  "num_parallel_executions": 4,
   "base_csv_path": "csv",
   "base_log_path": "log",
   "heavy_client_threshold": 8,
@@ -157,12 +155,17 @@
   ],
   "common_search_space": {
     "encryption_mode": [
-      "no_encryption"
+      "no_encryption",
+      "homomorphic"
+    ],
+    "he_backend": [
+      "ckks"
     ],
     "device": [
       "cuda"
     ],
     "global_epoch": [
+      5,
       10,
       20,
       30
@@ -196,7 +199,7 @@
     ]
   },
   "model_specific_search_space": {
-    "GoogLeNet": {
+    "AlexNet": {
       "image_size": [
         128,
         224
@@ -206,14 +209,16 @@
         4
       ]
     },
-    "AlexNet": {
+    "ConvNet": {
       "image_size": [
         128,
         224
       ],
-      "num_custom_layers": [
-        2,
-        4
+      "convnet_hidden1": [
+        32
+      ],
+      "convnet_hidden2": [
+        16
       ]
     },
     "ResNet18": {

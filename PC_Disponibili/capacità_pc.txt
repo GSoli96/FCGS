@@ -1,0 +1,150 @@
+Host msi
+CPU
+
+	12th Gen Intel(R) Core(TM) i9-12900H
+
+	Velocità di base:	2,90 GHz
+	Processori fisici:	1
+	Cores:	14
+	Processori logici:	20
+	Virtualizzazione:	Abilitato
+	Cache L1:	1,2 MB
+	Cache L2:	11,5 MB
+	Cache L3:	24,0 MB
+
+	Utilizzo	30%
+	Velocità	3,09 GHz
+	Tempo di attività	0:01:01:42
+	Processi	257
+	Thread	4966
+	Handle	141030
+
+Memoria
+
+	16,0 GB
+
+	Velocità:	3200 MT/s
+	Slot utilizzati:	2 di 2
+	Fattore formato:	SODIMM
+	Riservata per l'hardware:	295 MB
+
+	Disponibile	4,1 GB
+	Cache	2,4 GB
+	Vincolata	34,2/47,5 GB
+	Pool di paging	571 MB
+	Pool non di paging	539 MB
+	In uso (compressa)	11,5 GB (364 MB)
+
+GPU 1
+
+	NVIDIA GeForce RTX 3060 Laptop GPU
+
+	Versione driver:	32.0.15.7260
+	Data driver:	25/02/2025
+	Versione DirectX:	12 (FL 12.2)
+	Località fisica:	Bus PCI 1, dispositivo 0, funzione 0
+
+	Utilizzo	32%
+	Memoria GPU dedicata	1,1/6,0 GB
+	Memoria GPU condivisa	0,3/7,9 GB
+	Memoria GPU	1,4/13,9 GB
+
+NB Non appesantiamo troppo, ci ta gia un processo in esecuzione
+-------------------------------------------------------------------------
+
+Host domino11 e Host domino12
+Domino 11 e Domino 12
++-----------------------------------------------------------------------------------------+
+| NVIDIA-SMI 596.36                 Driver Version: 596.36         CUDA Version: 13.2     |
++-----------------------------------------+------------------------+----------------------+
+| GPU  Name                  Driver-Model | Bus-Id          Disp.A | Volatile Uncorr. ECC |
+| Fan  Temp   Perf          Pwr:Usage/Cap |           Memory-Usage | GPU-Util  Compute M. |
+|                                         |                        |               MIG M. |
+|=========================================+========================+======================|
+|   0  NVIDIA GeForce RTX 3070 ...  WDDM  |   00000000:01:00.0 Off |                  N/A |
+| N/A   45C    P8             10W /   92W |       1MiB /   8192MiB |      0%      Default |
+|                                         |                        |                  N/A |
++-----------------------------------------+------------------------+----------------------+
+
+NB Non appesantiamo troppo, ti ricordo che Domino11 ha il caricabatteria che non va molto, quindi non puo eseguire carichi pensati, max 1 worker
+-------------------------------------------------------------------------
+
+Host geoscience
++---------------------------------------------------------------------------------------+
+| NVIDIA-SMI 535.309.01             Driver Version: 535.309.01   CUDA Version: 12.2     |
+|-----------------------------------------+----------------------+----------------------+
+| GPU  Name                 Persistence-M | Bus-Id        Disp.A | Volatile Uncorr. ECC |
+| Fan  Temp   Perf          Pwr:Usage/Cap |         Memory-Usage | GPU-Util  Compute M. |
+|                                         |                      |               MIG M. |
+|=========================================+======================+======================|
+|   0  NVIDIA A800 40GB Active        Off | 00000000:16:00.0 Off |                    0 |
+| 52%   74C    P0             119W / 240W |  17314MiB / 40960MiB |     10%      Default |
+|                                         |                      |             Disabled |
++-----------------------------------------+----------------------+----------------------+
+|   1  NVIDIA RTX A1000               Off | 00000000:34:00.0 Off |                  N/A |
+| 30%   42C    P8              N/A /  50W |    183MiB /  8188MiB |      0%      Default |
+|                                         |                      |                  N/A |
++-----------------------------------------+----------------------+----------------------+
+|   2  NVIDIA A800 40GB Active        Off | 00000000:AC:00.0 Off |                    0 |
+| 30%   56C    P0              57W / 240W |      3MiB / 40960MiB |      0%      Default |
+|                                         |                      |             Disabled |
++-----------------------------------------+----------------------+----------------------+
+|   3  NVIDIA A800 40GB Active        Off | 00000000:CA:00.0 Off |                    0 |
+| 30%   51C    P0              49W / 240W |      3MiB / 40960MiB |      0%      Default |
+|                                         |                      |             Disabled |
++-----------------------------------------+----------------------+----------------------+
+
+---------------------------------------------------------------------------------------
+Host alienware
+CPU
+
+	Intel(R) Core(TM) Ultra 9 285K
+
+	Velocità di base:	3,70 GHz
+	Processori fisici:	1
+	Cores:	24
+	Processori logici:	24
+	Virtualizzazione:	Abilitato
+	Cache L1:	2,4 MB
+	Cache L2:	40,0 MB
+	Cache L3:	36,0 MB
+
+	Utilizzo	6%
+	Velocità	4,64 GHz
+	Tempo di attività	2:10:01:32
+	Processi	333
+	Thread	6792
+	Handle	194380
+
+Memoria
+
+	64,0 GB
+
+	Velocità:	6400 MT/s
+	Slot utilizzati:	2 di 2
+	Fattore formato:	DIMM
+	Riservata per l'hardware:	557 MB
+
+	Disponibile	44,2 GB
+	Cache	22,4 GB
+	Vincolata	25/168 GB
+	Pool di paging	1,2 GB
+	Pool non di paging	1,5 GB
+	In uso (compressa)	18,7 GB (0 MB)
+
+GPU 1
+
+	NVIDIA GeForce RTX 5090
+
+	Versione driver:	32.0.15.8195
+	Data driver:	18/11/2025
+	Versione DirectX:	12 (FL 12.2)
+	Località fisica:	Bus PCI 1, dispositivo 0, funzione 0
+
+	Utilizzo	1%
+	Memoria GPU dedicata	2,1/31,5 GB
+	Memoria GPU condivisa	0,2/36,2 GB
+	Memoria GPU	2,3/67,7 GB
+
+
+
