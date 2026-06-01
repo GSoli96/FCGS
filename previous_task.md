@@ -49,16 +49,16 @@ Tutti i 22 dataset OK al 100% — nessun dataset da scaricare
 
 ---
 
-## Stato esperimenti al 2026-06-01 sera
+## Stato esperimenti al 2026-06-01 sera (TUTTI AVVIATI)
 
-| PC | Stato | Note |
-|---|---|---|
-| **MSI** | **FCGS IN ESECUZIONE** ✓ | Dataset copiati da Siando, avviata manualmente |
-| **MSIDomino12** | In attesa completamento copia dataset | Poi ricreare venv + avviare |
-| **MSIDomino11** | In attesa completamento copia dataset | Poi ricreare venv + avviare |
-| **Alienware** | In attesa completamento copia dataset | Venv Python 3.11 già installato |
-| **geosciences** | Dataset 100% OK, pronta per avvio | Venv da ricreare senza tenseal |
-| **Siando** | Non monitorato | |
+| PC | Stato | PID | Note |
+|---|---|---|---|
+| **MSI** | ✓ IN ESECUZIONE | 15888 | Dataset 100% da Siando SCP |
+| **MSIDomino11** | ✓ IN ESECUZIONE | 6092 | Dataset 100% da Siando SCP, Python 3.11 |
+| **MSIDomino12** | ✓ IN ESECUZIONE | 13152 | Dataset 100% da Siando SCP, Python 3.11 |
+| **Alienware** | ✓ IN ESECUZIONE | 34304 | Dataset 100%, PyTorch cu130 (RTX 5090 sm_120) |
+| **geosciences** | ✓ IN ESECUZIONE | 1335740 | Dataset 22/22 al 100%, nohup, Python 3.x senza tenseal |
+| **Siando** | NON avviato | — | Non monitorato in questa sessione |
 
 ---
 
@@ -145,10 +145,15 @@ pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
 
 ---
 
+## Nota Alienware — PyTorch CUDA
+RTX 5090 = architettura Blackwell (sm_120). Richiede PyTorch cu130, NON cu128.
+```cmd
+pip install torch torchvision --index-url https://download.pytorch.org/whl/cu130
+```
+
 ## Cosa fare la prossima sessione
 
-1. Verificare completamento copia dataset su Domino12, Domino11, Alienware
-2. Ricreare venv su Domino12 e Domino11 (Python 3.11, cu126)
-3. Avviare FCGS su Domino12, Domino11, Alienware, geosciences
-4. Monitorare Telegram heartbeat — verificare che MSI stia girando correttamente
-5. Consolidare CSV quando più PC completano configurazioni
+1. Monitorare Telegram heartbeat su tutti i 5 PC — verificare che non ci siano crash
+2. Verificare che Domino11 (max 1 worker per caricabatterie) non sia sotto carico eccessivo
+3. Consolidare CSV quando più PC completano configurazioni (`consolidate_results.py`)
+4. Avviare Siando se serve capacità aggiuntiva
