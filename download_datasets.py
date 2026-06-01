@@ -101,7 +101,7 @@ def _download_one(repo_id: str, token: str, ds: dict, attempt: int = 1, max_retr
                     continue
 
             actual = _count_images(hf_path)
-            if expected > 0 and actual < expected * 0.9:
+            if expected > 0 and actual < expected:
                 print(f"    Incompleto: {actual}/{expected} ({actual/expected*100:.1f}%) "
                       f"— tentativo {att}/{max_retries}")
                 if att < max_retries:
