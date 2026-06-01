@@ -93,7 +93,9 @@ _DOWNLOAD_TIMEOUT_S = 1800  # 30 min per singolo dataset — previene hang indef
 def _download_folder(repo_id: str, token: str, hf_path: str,
                      max_retries: int = 3, logger: Optional[logging.Logger] = None) -> bool:
     """Scarica una singola cartella del dataset dal repo HF, con retry e timeout per-download."""
+    import errno
     import time
+    import traceback
     import concurrent.futures
     from huggingface_hub import snapshot_download
     hf_path = hf_path.replace('\\', '/')
@@ -129,8 +131,18 @@ def _download_folder(repo_id: str, token: str, hf_path: str,
             _log(f"  [DatasetManager] '{hf_path}': download completato ma nessuna immagine "
                  f"(tentativo {attempt}/{max_retries}).", logger, 'warning')
         except Exception as e:
+            tb = traceback.format_exc()
             _log(f"  [DatasetManager] ERRORE download '{hf_path}' "
                  f"(tentativo {attempt}/{max_retries}): {e}", logger, 'error')
+            # errno 22 su Windows = path troppo lungo (MAX_PATH 260) o caratteri non validi nel nome file.
+            # Hint utile per debug: abilitare i long paths con:
+            #   reg add "HKLM\SYSTEM\CurrentControlSet\Control\FileSystem" /v LongPathsEnabled /t REG_DWORD /d 1 /f
+            if isinstance(e, OSError) and e.errno == errno.EINVAL:
+                _log(f"  [DatasetManager] HINT [Errno 22]: probabile path troppo lungo (MAX_PATH Windows) "
+                     f"o carattere non valido nel nome file del dataset.\n"
+                     f"  Traceback completo:\n{tb}", logger, 'error')
+            else:
+                _log(f"  [DatasetManager] Traceback:\n{tb}", logger, 'error')
         if attempt < max_retries:
             wait = 30 * attempt
             _log(f"  [DatasetManager] Attendo {wait}s prima di riprovare...", logger)
