@@ -77,9 +77,13 @@ def _download_one(repo_id: str, token: str, ds: dict, attempt: int = 1, max_retr
     for att in range(1, max_retries + 1):
         try:
             def _do():
-                # hf_xet è usato automaticamente da snapshot_download quando installato.
-                # Xet scarica i file in chunk paralleli → molto più veloce di HTTPS standard.
-                # max_workers=4 per i chunk Xet interni (non download paralleli di file diversi).
+                # Disabilita i progress bar interni di HuggingFace (uno per file).
+                # Usiamo il nostro progress bar unico per dataset.
+                try:
+                    import huggingface_hub.utils as _hfu
+                    _hfu.disable_progress_bars()
+                except Exception:
+                    pass
                 snapshot_download(
                     repo_id=repo_id,
                     repo_type='dataset',
@@ -90,15 +94,47 @@ def _download_one(repo_id: str, token: str, ds: dict, attempt: int = 1, max_retr
                     max_workers=4,
                 )
 
+            # Progress bar che mostra immagini scaricate durante il download
+            start_count = _count_images(hf_path)
+            bar = None
+            stop_monitor = threading.Event()
+
+            def _monitor():
+                nonlocal bar
+                if _TQDM_OK and expected > 0:
+                    bar = tqdm(total=expected, initial=start_count,
+                               desc=f"  {hf_path.split('/')[-1][:30]}",
+                               unit='img', leave=False, dynamic_ncols=True)
+                    last = start_count
+                    while not stop_monitor.is_set():
+                        cur = _count_images(hf_path)
+                        if cur > last:
+                            bar.update(cur - last)
+                            last = cur
+                        stop_monitor.wait(timeout=2)
+                    cur = _count_images(hf_path)
+                    if cur > last:
+                        bar.update(cur - last)
+                    bar.close()
+
+            import threading as _th
+            mon = _th.Thread(target=_monitor, daemon=True)
+            mon.start()
+
             with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
                 fut = ex.submit(_do)
                 try:
                     fut.result(timeout=timeout_s)
                 except concurrent.futures.TimeoutError:
+                    stop_monitor.set()
+                    mon.join(timeout=3)
                     print(f"    TIMEOUT dopo {timeout_s}s (tentativo {att}/{max_retries})")
                     if att < max_retries:
                         time.sleep(30 * att)
                     continue
+
+            stop_monitor.set()
+            mon.join(timeout=3)
 
             actual = _count_images(hf_path)
             if expected > 0 and actual < expected:
