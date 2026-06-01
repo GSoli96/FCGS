@@ -133,7 +133,14 @@ def main():
     parser.add_argument('--check', action='store_true', help='Solo verifica stato, non scarica')
     parser.add_argument('--retries', type=int, default=5, help='Tentativi per dataset (default: 5)')
     parser.add_argument('--timeout', type=int, default=1800, help='Timeout per download in secondi (default: 1800)')
+    parser.add_argument('--token', type=str, help='Token HuggingFace (Read). Verrà salvato in .hf_token per usi futuri.')
     args = parser.parse_args()
+
+    # Salva il token in .hf_token se passato via --token
+    if args.token:
+        token_file = _SCRIPT_DIR / '.hf_token'
+        token_file.write_text(args.token.strip(), encoding='utf-8')
+        print(f"Token salvato in {token_file}")
 
     config_path = Path(args.config) if args.config else _find_config()
     print(f"Config: {config_path.name}")
@@ -149,7 +156,8 @@ def main():
     token = _get_hf_token()
     if not token:
         print("ERRORE: token HuggingFace non trovato.")
-        print("  Crea .hf_token nella cartella FCGS oppure imposta HF_TOKEN=...")
+        print("  Usa: python download_datasets.py --token hf_xxxxxxxxxxxx")
+        print("  Oppure crea .hf_token nella cartella FCGS")
         print("  Token: https://huggingface.co/settings/tokens (tipo: Read)")
         sys.exit(1)
     print(f"Token HF: {token[:8]}...{token[-4:]}")
