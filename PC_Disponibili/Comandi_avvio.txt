@@ -3,9 +3,6 @@ COMANDI DA ESEGUIRE DIRETTAMENTE SUL PC (dopo ssh <pc>)
 ============================================================
 Una volta dentro la sessione SSH, usa questi comandi — nessun problema di quoting.
 
-AVVIO: usa wmic se disponibile, altrimenti Start-Process (PowerShell).
-  wmic non disponibile su Windows 11 recenti → usa Start-Process.
-
  ---
   MSI  (path: C:\Users\giand\Desktop\prog\FCGS)
 
@@ -13,14 +10,14 @@ AVVIO: usa wmic se disponibile, altrimenti Start-Process (PowerShell).
   cd C:\Users\giand\Desktop\prog\FCGS
   powershell Start-Process -FilePath venv\Scripts\python.exe -ArgumentList federated_grid_search.py -WorkingDirectory C:\Users\giand\Desktop\prog\FCGS -WindowStyle Hidden
 
-  # PID (aspetta 5 secondi)
+  # PID (aspetta 5-10 secondi)
   powershell Get-Content log\log_MSI\bootstrap.log
 
   # Log in tempo reale
   powershell Get-Content log\log_MSI\main.log -Wait -Tail 30
 
-  # Kill FCGS
-  wmic process where "Name='python.exe' and CommandLine like '%federated_grid_search%'" delete
+  # Kill solo FCGS (non altri Python)
+  powershell "Get-CimInstance Win32_Process | Where-Object {$_.Name -eq 'python.exe' -and $_.CommandLine -like '*federated_grid_search*'} | ForEach-Object {Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue}"
 
  ---
   Domino12  (path: C:\Users\dastl\Desktop\Giando\FCGS)
@@ -32,7 +29,7 @@ AVVIO: usa wmic se disponibile, altrimenti Start-Process (PowerShell).
 
   powershell Get-Content log\log_MSIDomino12\main.log -Wait -Tail 30
 
-  wmic process where "Name='python.exe' and CommandLine like '%federated_grid_search%'" delete
+  powershell "Get-CimInstance Win32_Process | Where-Object {$_.Name -eq 'python.exe' -and $_.CommandLine -like '*federated_grid_search*'} | ForEach-Object {Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue}"
 
  ---
   Domino11  (path: C:\Users\domin\Desktop\prog\FCGS)
@@ -44,7 +41,7 @@ AVVIO: usa wmic se disponibile, altrimenti Start-Process (PowerShell).
 
   powershell Get-Content log\log_MSIDomino11\main.log -Wait -Tail 30
 
-  wmic process where "Name='python.exe' and CommandLine like '%federated_grid_search%'" delete
+  powershell "Get-CimInstance Win32_Process | Where-Object {$_.Name -eq 'python.exe' -and $_.CommandLine -like '*federated_grid_search*'} | ForEach-Object {Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue}"
 
  ---
   Alienware  (path: C:\Users\daisl\Desktop\Giando\FCGS)
@@ -56,13 +53,12 @@ AVVIO: usa wmic se disponibile, altrimenti Start-Process (PowerShell).
 
   powershell Get-Content log\log_DAIS-RTX-5000-5\main.log -Wait -Tail 30
 
-  wmic process where "Name='python.exe' and CommandLine like '%federated_grid_search%'" delete
+  powershell "Get-CimInstance Win32_Process | Where-Object {$_.Name -eq 'python.exe' -and $_.CommandLine -like '*federated_grid_search*'} | ForEach-Object {Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue}"
 
 ============================================================
-KILL PER PID (se wmic lascia worker orfani)
+KILL PER PID (se rimangono worker orfani con tanta RAM)
 ============================================================
   Il PID lo trovi nel bootstrap.log: "main() avviato (PID XXXXX)"
-  Poi killa workers orfani (processi python.exe in Services con tanta RAM):
 
   taskkill /F /PID XXXXX
 
@@ -76,7 +72,7 @@ COMANDI DA SIANDO (ssh remoto, singoli apici)
   ssh domin@domino11 "powershell Start-Process -FilePath venv\Scripts\python.exe -ArgumentList federated_grid_search.py -WorkingDirectory C:\Users\domin\Desktop\prog\FCGS -WindowStyle Hidden"
   ssh daisl@alienware "powershell Start-Process -FilePath venv\Scripts\python.exe -ArgumentList federated_grid_search.py -WorkingDirectory C:\Users\daisl\Desktop\Giando\FCGS -WindowStyle Hidden"
 
-  # PID (aspetta 5 secondi)
+  # PID (aspetta 5-10 secondi)
   ssh giand@msi "powershell Get-Content 'C:\Users\giand\Desktop\prog\FCGS\log\log_MSI\bootstrap.log'"
   ssh dastl@domino12 "powershell Get-Content 'C:\Users\dastl\Desktop\Giando\FCGS\log\log_MSIDomino12\bootstrap.log'"
   ssh domin@domino11 "powershell Get-Content 'C:\Users\domin\Desktop\prog\FCGS\log\log_MSIDomino11\bootstrap.log'"
@@ -88,8 +84,8 @@ COMANDI DA SIANDO (ssh remoto, singoli apici)
   ssh domin@domino11 "powershell Get-Content 'C:\Users\domin\Desktop\prog\FCGS\log\log_MSIDomino11\main.log' -Wait -Tail 30"
   ssh daisl@alienware "powershell Get-Content 'C:\Users\daisl\Desktop\Giando\FCGS\log\log_DAIS-RTX-5000-5\main.log' -Wait -Tail 30"
 
-  # Kill FCGS
-  ssh giand@msi 'wmic process where "Name=''python.exe'' and CommandLine like ''%federated_grid_search%''" delete'
-  ssh dastl@domino12 'wmic process where "Name=''python.exe'' and CommandLine like ''%federated_grid_search%''" delete'
-  ssh domin@domino11 'wmic process where "Name=''python.exe'' and CommandLine like ''%federated_grid_search%''" delete'
-  ssh daisl@alienware 'wmic process where "Name=''python.exe'' and CommandLine like ''%federated_grid_search%''" delete'
+  # Kill solo FCGS (da Siando, singoli apici per evitare espansione $)
+  ssh giand@msi 'powershell "Get-CimInstance Win32_Process | Where-Object {$_.Name -eq ''python.exe'' -and $_.CommandLine -like ''*federated_grid_search*''} | ForEach-Object {Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue}"'
+  ssh dastl@domino12 'powershell "Get-CimInstance Win32_Process | Where-Object {$_.Name -eq ''python.exe'' -and $_.CommandLine -like ''*federated_grid_search*''} | ForEach-Object {Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue}"'
+  ssh domin@domino11 'powershell "Get-CimInstance Win32_Process | Where-Object {$_.Name -eq ''python.exe'' -and $_.CommandLine -like ''*federated_grid_search*''} | ForEach-Object {Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue}"'
+  ssh daisl@alienware 'powershell "Get-CimInstance Win32_Process | Where-Object {$_.Name -eq ''python.exe'' -and $_.CommandLine -like ''*federated_grid_search*''} | ForEach-Object {Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue}"'
