@@ -1,0 +1,58 @@
+ ---
+  MSI
+
+  # Avvio (singoli apici — funziona da PowerShell senza errori &&)
+  ssh giand@msi 'wmic process call create "cmd.exe /c cd /D ""C:\Users\giand\Desktop\prog\FCGS"" && ""venv\Scripts\python.exe"" federated_grid_search.py"'
+
+  # PID (aspetta 5 secondi poi leggi)
+  ssh giand@msi "powershell Get-Content 'C:\Users\giand\Desktop\prog\FCGS\log\log_MSI\bootstrap.log'"
+
+  # Log in tempo reale
+  ssh giand@msi "powershell Get-Content 'C:\Users\giand\Desktop\prog\FCGS\log\log_MSI\main.log' -Wait -Tail 30"
+
+  # Kill FCGS (solo federated_grid_search, non altri Python)
+  ssh giand@msi 'wmic process where "Name=''python.exe'' and CommandLine like ''%federated_grid_search%''" delete'
+
+ ---
+  Domino12
+
+  ssh dastl@domino12 'wmic process call create "cmd.exe /c cd /D ""C:\Users\dastl\Desktop\Giando\FCGS"" && ""venv\Scripts\python.exe"" federated_grid_search.py"'
+
+  ssh dastl@domino12 "powershell Get-Content 'C:\Users\dastl\Desktop\Giando\FCGS\log\log_MSIDomino12\bootstrap.log'"
+
+  ssh dastl@domino12 "powershell Get-Content 'C:\Users\dastl\Desktop\Giando\FCGS\log\log_MSIDomino12\main.log' -Wait -Tail 30"
+
+  ssh dastl@domino12 'wmic process where "Name=''python.exe'' and CommandLine like ''%federated_grid_search%''" delete'
+
+ ---
+  Domino11
+
+  ssh domin@domino11 'wmic process call create "cmd.exe /c cd /D ""C:\Users\domin\Desktop\prog\FCGS"" && ""venv\Scripts\python.exe"" federated_grid_search.py"'
+
+  ssh domin@domino11 "powershell Get-Content 'C:\Users\domin\Desktop\prog\FCGS\log\log_MSIDomino11\bootstrap.log'"
+
+  ssh domin@domino11 "powershell Get-Content 'C:\Users\domin\Desktop\prog\FCGS\log\log_MSIDomino11\main.log' -Wait -Tail 30"
+
+  ssh domin@domino11 'wmic process where "Name=''python.exe'' and CommandLine like ''%federated_grid_search%''" delete'
+
+ ---
+  Alienware
+
+  ssh daisl@alienware 'wmic process call create "cmd.exe /c cd /D ""C:\Users\daisl\Desktop\Giando\FCGS"" && ""venv\Scripts\python.exe"" federated_grid_search.py"'
+
+  ssh daisl@alienware "powershell Get-Content 'C:\Users\daisl\Desktop\Giando\FCGS\log\log_DAIS-RTX-5000-5\bootstrap.log'"
+
+  ssh daisl@alienware "powershell Get-Content 'C:\Users\daisl\Desktop\Giando\FCGS\log\log_DAIS-RTX-5000-5\main.log' -Wait -Tail 30"
+
+  ssh daisl@alienware 'wmic process where "Name=''python.exe'' and CommandLine like ''%federated_grid_search%''" delete'
+
+ ---
+  Kill per PID (se wmic lascia worker orfani)
+
+  Il PID lo trovi nel bootstrap.log: "main() avviato (PID XXXXX)"
+  Poi killa workers orfani (processi python.exe in Services con tanta RAM):
+
+  ssh giand@msi "taskkill /F /PID XXXXX"
+  ssh dastl@domino12 "taskkill /F /PID XXXXX"
+  ssh domin@domino11 "taskkill /F /PID XXXXX"
+  ssh daisl@alienware "taskkill /F /PID XXXXX"
