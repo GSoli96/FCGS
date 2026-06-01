@@ -32,8 +32,8 @@ Alienware (via SSH):
 Alienware (via SSH):
   ssh daisl@alienware "powershell Get-Content 'C:\Users\daisl\Desktop\Giando\FCGS\log\log_DAIS-RTX-5000-5\main.log' -Wait -Tail 30"
 
-geosciences — FCGS grid search (via SSH):
-  ssh mldl@geosciences "tail -f /home/mldl/itadata/FCGS/log/log_geosciences/main.log"
+geosciences — FCGS grid search (da terminale geosciences):
+  tail -f /home/mldl/itadata/FCGS/log/log_geosciences/main.log
 
 geosciences — Stress test run corrente:
   ssh mldl@geosciences "tail -f /home/mldl/itadata/FCGS/geosciences_stress_test/logs/stress_*/run_w*.log"

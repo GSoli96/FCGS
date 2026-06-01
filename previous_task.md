@@ -57,7 +57,7 @@ Tutti i 22 dataset OK al 100% — nessun dataset da scaricare
 | **MSIDomino11** | ✓ IN ESECUZIONE | 6092 | Dataset 100% da Siando SCP, Python 3.11 |
 | **MSIDomino12** | ✓ IN ESECUZIONE | 13152 | Dataset 100% da Siando SCP, Python 3.11 |
 | **Alienware** | ✓ IN ESECUZIONE | 34304 | Dataset 100%, PyTorch cu130 (RTX 5090 sm_120) |
-| **geosciences** | ✓ IN ESECUZIONE | 1335740 | Dataset 22/22 al 100%, nohup, Python 3.x senza tenseal |
+| **geosciences** | ✓ IN ESECUZIONE | 1335740 | Dataset 22/22 al 100%, nohup, Python 3.x senza tenseal, log: tail -f /home/mldl/itadata/FCGS/log/log_geosciences/main.log |
 | **Siando** | NON avviato | — | Non monitorato in questa sessione |
 
 ---
@@ -151,9 +151,34 @@ RTX 5090 = architettura Blackwell (sm_120). Richiede PyTorch cu130, NON cu128.
 pip install torch torchvision --index-url https://download.pytorch.org/whl/cu130
 ```
 
+## Config da eseguire per PC (al momento dell'avvio)
+
+| PC | Config totali | Worker |
+|---|---|---|
+| MSI | 3.743 | 2 |
+| Domino11 | 16.896 | 1 |
+| Domino12 | 16.896 | 3 |
+| Alienware | 41.619 | 4 |
+| geosciences | da verificare | da verificare |
+
+## Log in tempo reale
+
+```powershell
+# Windows (da Siando)
+ssh giand@msi "powershell Get-Content 'C:\Users\giand\Desktop\prog\FCGS\log\log_MSI\main.log' -Wait -Tail 20"
+ssh domin@domino11 "powershell Get-Content 'C:\Users\domin\Desktop\prog\FCGS\log\log_MSIDomino11\main.log' -Wait -Tail 20"
+ssh dastl@domino12 "powershell Get-Content 'C:\Users\dastl\Desktop\Giando\FCGS\log\log_MSIDomino12\main.log' -Wait -Tail 20"
+ssh daisl@alienware "powershell Get-Content 'C:\Users\daisl\Desktop\Giando\FCGS\log\log_DAIS-RTX-5000-5\main.log' -Wait -Tail 20"
+```
+```bash
+# geosciences (da terminale geosciences)
+tail -f /home/mldl/itadata/FCGS/log/log_geosciences/main.log
+```
+
 ## Cosa fare la prossima sessione
 
-1. Monitorare Telegram heartbeat su tutti i 5 PC — verificare che non ci siano crash
-2. Verificare che Domino11 (max 1 worker per caricabatterie) non sia sotto carico eccessivo
-3. Consolidare CSV quando più PC completano configurazioni (`consolidate_results.py`)
-4. Avviare Siando se serve capacità aggiuntiva
+1. Controllare log di tutti i PC (~4h dopo avvio, intorno alle 20:00-21:00)
+2. Verificare heartbeat Telegram — primo intorno alle 20:00
+3. Verificare che Domino11 (max 1 worker) non sia sotto carico eccessivo
+4. Consolidare CSV quando più PC completano configurazioni (`consolidate_results.py`)
+5. Avviare Siando se serve capacità aggiuntiva
