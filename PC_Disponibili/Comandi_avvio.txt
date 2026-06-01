@@ -3,6 +3,9 @@ COMANDI DA ESEGUIRE DIRETTAMENTE SUL PC (dopo ssh <pc>)
 ============================================================
 Una volta dentro la sessione SSH, usa questi comandi — nessun problema di quoting.
 
+AVVIO: usa wmic se disponibile, altrimenti Start-Process (PowerShell).
+  wmic non disponibile su Windows 11 recenti → usa Start-Process.
+
  ---
   MSI  (path: C:\Users\giand\Desktop\prog\FCGS)
 
@@ -35,7 +38,7 @@ Una volta dentro la sessione SSH, usa questi comandi — nessun problema di quot
   Domino11  (path: C:\Users\domin\Desktop\prog\FCGS)
 
   cd C:\Users\domin\Desktop\prog\FCGS
-  wmic process call create "cmd.exe /c cd /D C:\Users\domin\Desktop\prog\FCGS && venv\Scripts\python.exe federated_grid_search.py"
+  powershell Start-Process -FilePath venv\Scripts\python.exe -ArgumentList federated_grid_search.py -WorkingDirectory C:\Users\domin\Desktop\prog\FCGS -WindowStyle Hidden
 
   powershell Get-Content log\log_MSIDomino11\bootstrap.log
 
