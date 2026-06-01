@@ -7,7 +7,7 @@ Percorsi FCGS per PC:
   MSI                : C:\Users\giand\Desktop\prog\FCGS\
   MSIDomino12        : C:\Users\dastl\Desktop\Giando\FCGS\
   MSIDomino11        : C:\Users\domin\Desktop\prog\FCGS\
-  Alienware          : <FCGS_PATH>   (da impostare)
+  Alienware          : C:\Users\daisl\Desktop\Giando\FCGS\  (hostname: DAIS-RTX-5000-5)
 
 ------------------------------------------------------------
 LOG IN TEMPO REALE (equivalente di tail -f)
@@ -26,7 +26,7 @@ MSIDomino11 (via SSH):
   ssh domin@domino11 "powershell Get-Content 'C:\Users\domin\Desktop\prog\FCGS\log\log_MSIDomino11\main.log' -Wait -Tail 30"
 
 Alienware (via SSH):
-  ssh <user>@alienware "powershell Get-Content '<FCGS_PATH>\log\log_Alienware\main.log' -Wait -Tail 30"
+  ssh daisl@alienware "powershell Get-Content 'C:\Users\daisl\Desktop\Giando\FCGS\log\log_DAIS-RTX-5000-5\main.log' -Wait -Tail 30"
 
 ------------------------------------------------------------
 ENTRARE VIA SSH (sessione interattiva)
@@ -35,7 +35,7 @@ ENTRARE VIA SSH (sessione interattiva)
 MSI:        ssh giand@msi
 Domino12:   ssh dastl@domino12
 Domino11:   ssh domin@domino11
-Alienware:  ssh <user>@alienware
+Alienware:  ssh daisl@alienware
 
 ------------------------------------------------------------
 VERIFICA PROCESSI PYTHON ATTIVI
@@ -54,7 +54,7 @@ MSIDomino11:
   ssh domin@domino11 "tasklist | findstr python"
 
 Alienware:
-  ssh <user>@alienware "tasklist | findstr python"
+  ssh daisl@alienware "tasklist | findstr python"
 
 ------------------------------------------------------------
 AVVIO PROCESSO FCGS (wmic = detached, sopravvive alla chiusura SSH)
@@ -70,7 +70,7 @@ MSIDomino11:
   ssh domin@domino11 "wmic process call create \"cmd.exe /c cd /D \"\"C:\Users\domin\Desktop\prog\FCGS\"\" && \"\"venv\Scripts\python.exe\"\" federated_grid_search.py\""
 
 Alienware:
-  ssh <user>@alienware "wmic process call create \"cmd.exe /c cd /D \"\"<FCGS_PATH>\"\" && \"\"venv\Scripts\python.exe\"\" federated_grid_search.py\""
+  ssh daisl@alienware "wmic process call create \"cmd.exe /c cd /D \"\"C:\Users\daisl\Desktop\Giando\FCGS\"\" && \"\"venv\Scripts\python.exe\"\" federated_grid_search.py\""
 
 ------------------------------------------------------------
 KILL SOLO PROCESSI FCGS (non tocca altri processi Python)
@@ -89,7 +89,7 @@ MSIDomino11:
   ssh domin@domino11 "wmic process where \"Name='python.exe' and CommandLine like '%federated_grid_search%'\" delete"
 
 Alienware:
-  ssh <user>@alienware "wmic process where \"Name='python.exe' and CommandLine like '%federated_grid_search%'\" delete"
+  ssh daisl@alienware "wmic process where \"Name='python.exe' and CommandLine like '%federated_grid_search%'\" delete"
 
 NOTA: se wmic lascia worker orfani (processi python.exe in "Services" con tanta RAM),
 killali per PID con: taskkill /F /PID <pid1> /PID <pid2> ...
@@ -108,7 +108,7 @@ MSIDomino11:
   ssh domin@domino11 "powershell -Command ""Set-Location 'C:\Users\domin\Desktop\prog\FCGS'; git pull origin main"""
 
 Alienware:
-  ssh <user>@alienware "powershell -Command ""Set-Location '<FCGS_PATH>'; git pull origin main"""
+  ssh daisl@alienware "powershell -Command ""Set-Location 'C:\Users\daisl\Desktop\Giando\FCGS'; git pull origin main"""
 
 ------------------------------------------------------------
 CONTA CSV RISULTATI
