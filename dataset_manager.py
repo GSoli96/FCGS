@@ -91,7 +91,8 @@ _DOWNLOAD_TIMEOUT_S = 1800  # 30 min per singolo dataset — previene hang indef
 
 
 def _download_folder(repo_id: str, token: str, hf_path: str,
-                     max_retries: int = 3, logger: Optional[logging.Logger] = None) -> bool:
+                     max_retries: int = 3, logger: Optional[logging.Logger] = None,
+                     expected_images: int = 0) -> bool:
     """Scarica una singola cartella del dataset dal repo HF, con retry e timeout per-download."""
     import errno
     import time
@@ -112,6 +113,17 @@ def _download_folder(repo_id: str, token: str, hf_path: str,
             max_workers=1,
         )
 
+    def _is_complete() -> bool:
+        actual = _count_images(hf_path)
+        if expected_images > 0:
+            threshold = expected_images * 0.9
+            if actual < threshold:
+                _log(f"  [DatasetManager] '{hf_path}': {actual}/{expected_images} immagini "
+                     f"({actual/expected_images*100:.1f}%) — sotto soglia 90%, dataset incompleto.",
+                     logger, 'warning')
+                return False
+        return actual > 0
+
     for attempt in range(1, max_retries + 1):
         try:
             with concurrent.futures.ThreadPoolExecutor(max_workers=1) as _ex:
@@ -126,9 +138,9 @@ def _download_folder(repo_id: str, token: str, hf_path: str,
                         _log(f"  [DatasetManager] Attendo {wait}s prima di riprovare...", logger)
                         time.sleep(wait)
                     continue
-            if _dataset_exists(hf_path):
+            if _is_complete():
                 return True
-            _log(f"  [DatasetManager] '{hf_path}': download completato ma nessuna immagine "
+            _log(f"  [DatasetManager] '{hf_path}': download completato ma dataset incompleto "
                  f"(tentativo {attempt}/{max_retries}).", logger, 'warning')
         except Exception as e:
             tb = traceback.format_exc()
@@ -187,7 +199,8 @@ def _download_common(config: Dict, parallel: bool = True, max_parallel: int = 4,
         _log(f"[DatasetManager] Scarico {len(missing)} dataset da {repo_id} "
              f"({workers} in parallelo)...", logger)
         with ThreadPoolExecutor(max_workers=workers) as executor:
-            futures = {executor.submit(_download_folder, repo_id, token, ds['path'], 3, logger): ds
+            futures = {executor.submit(_download_folder, repo_id, token, ds['path'], 3, logger,
+                                       ds.get('num_images', 0)): ds
                        for ds in missing}
             for future in as_completed(futures):
                 ds = futures[future]
@@ -205,7 +218,7 @@ def _download_common(config: Dict, parallel: bool = True, max_parallel: int = 4,
         _log(f"[DatasetManager] Scarico da {repo_id} (sequenziale)...", logger)
         for ds in missing:
             _log(f"  -> {ds['name']} ...", logger)
-            ok = _download_folder(repo_id, token, ds['path'], 3, logger)
+            ok = _download_folder(repo_id, token, ds['path'], 3, logger, ds.get('num_images', 0))
             if ok:
                 _log(f"    [OK] {ds['name']} scaricato.", logger)
             else:
