@@ -87,24 +87,43 @@ def _find_missing(datasets: List[Dict], logger: Optional[logging.Logger] = None)
     return missing
 
 
+_DOWNLOAD_TIMEOUT_S = 1800  # 30 min per singolo dataset — previene hang indefiniti su connessioni stalled
+
+
 def _download_folder(repo_id: str, token: str, hf_path: str,
                      max_retries: int = 3, logger: Optional[logging.Logger] = None) -> bool:
-    """Scarica una singola cartella del dataset dal repo HF, con retry su errore."""
+    """Scarica una singola cartella del dataset dal repo HF, con retry e timeout per-download."""
     import time
+    import concurrent.futures
     from huggingface_hub import snapshot_download
     hf_path = hf_path.replace('\\', '/')
     patterns = [f"{hf_path}/*", f"{hf_path}/**/*"]
+
+    def _do_download():
+        snapshot_download(
+            repo_id=repo_id,
+            repo_type='dataset',
+            token=token,
+            local_dir=str(_SCRIPT_DIR),
+            allow_patterns=patterns,
+            ignore_patterns=['*.gitattributes'],
+            max_workers=1,
+        )
+
     for attempt in range(1, max_retries + 1):
         try:
-            snapshot_download(
-                repo_id=repo_id,
-                repo_type='dataset',
-                token=token,
-                local_dir=str(_SCRIPT_DIR),
-                allow_patterns=patterns,
-                ignore_patterns=['*.gitattributes'],
-                max_workers=1,
-            )
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as _ex:
+                _fut = _ex.submit(_do_download)
+                try:
+                    _fut.result(timeout=_DOWNLOAD_TIMEOUT_S)
+                except concurrent.futures.TimeoutError:
+                    _log(f"  [DatasetManager] TIMEOUT download '{hf_path}' dopo {_DOWNLOAD_TIMEOUT_S}s "
+                         f"(tentativo {attempt}/{max_retries}).", logger, 'error')
+                    if attempt < max_retries:
+                        wait = 30 * attempt
+                        _log(f"  [DatasetManager] Attendo {wait}s prima di riprovare...", logger)
+                        time.sleep(wait)
+                    continue
             if _dataset_exists(hf_path):
                 return True
             _log(f"  [DatasetManager] '{hf_path}': download completato ma nessuna immagine "

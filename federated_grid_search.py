@@ -333,6 +333,27 @@ _MODEL_COST = {
     'ResNet101': 6.0,
 }
 
+def _adaptive_startup_timeout(config: dict, base: int = 600) -> int:
+    """Compute a per-experiment server_startup_timeout based on workload complexity.
+
+    Larger datasets and heavier models require more time for clients to initialize
+    their data loaders and load model weights before sending the 'client_ready' event.
+    Homomorphic encryption (CKKS) adds significant extra setup time per client.
+    """
+    t = base
+    images = config.get('num_images', 1000)
+    # +30s for every extra 500 images above 1000
+    t += max(0, int((images - 1000) / 500) * 30)
+    model_extra = {
+        'AlexNet': 60, 'GoogLeNet': 120,
+        'ResNet18': 120, 'ResNet34': 180, 'ResNet50': 240, 'ResNet101': 360,
+    }
+    t += model_extra.get(config.get('model_name', ''), 0)
+    if config.get('encryption_mode') == 'homomorphic':
+        t += 300  # CKKS context generation + encrypted tensor init
+    return min(t, 3600)
+
+
 def compute_complexity_score(cfg: Dict) -> float:
     """
     Stima il costo computazionale di una configurazione FL.
@@ -662,6 +683,11 @@ def run_grid_search_worker(
 
             # Il server gira in un subprocess separato così, se si blocca,
             # possiamo killarlo con SIGKILL e liberare la porta immediatamente.
+            # Calcola il timeout di avvio adattivo in base alla complessità dell'esperimento.
+            adaptive_startup_timeout = _adaptive_startup_timeout(
+                config, config.get('server_startup_timeout', 600))
+            config['server_startup_timeout'] = adaptive_startup_timeout
+
             result_queue = multiprocessing.Queue()
             server_process = multiprocessing.Process(
                 target=_server_process_target,
@@ -673,10 +699,11 @@ def run_grid_search_worker(
             server_ready_timeout = config.get('server_ready_timeout', 60)
             server_join_timeout = config.get('server_join_timeout', 120)
             client_instances = []
-            if wait_for_server_ready(server_url, timeout=server_ready_timeout):
+            _server_started_ok = wait_for_server_ready(server_url, timeout=server_ready_timeout)
+            if _server_started_ok:
                 client_instances = run_multiple_clients.main(config, already_split=True)
             else:
-                msg = f"[W{worker_id}] Server non avviato per {dataset_name}|{model_name}. Skipping."
+                msg = f"[W{worker_id}] Server non avviato per {dataset_name}|{model_name} entro {server_ready_timeout}s."
                 print(msg)
                 if telegram_token and telegram_chat_id:
                     send_telegram(telegram_token, telegram_chat_id,
@@ -708,6 +735,18 @@ def run_grid_search_worker(
                     except Exception as _e:
                         print(f"[W{worker_id}] Error disconnecting client: {_e}")
 
+            # GPU + memory cleanup between runs: prevents VRAM accumulation across experiments
+            # which causes progressively slower client initialization and eventual startup timeouts.
+            try:
+                import torch as _torch
+                if _torch.cuda.is_available():
+                    _torch.cuda.empty_cache()
+                    print(f"[W{worker_id}] GPU cache cleared.")
+            except Exception:
+                pass
+            import gc as _gc
+            _gc.collect()
+
             try:
                 run_summary = result_queue.get(timeout=5)
             except Exception:
@@ -718,17 +757,28 @@ def run_grid_search_worker(
                 if fail_count is not None:
                     with fail_count.get_lock():
                         fail_count.value += 1
-                msg = f"[W{worker_id}] run_summary None per {dataset_name}|{model_name} (crash o kill server)."
+                # Distinguish failure causes for better diagnostics
+                _exitcode = server_process.exitcode
+                if not _server_started_ok:
+                    _fail_reason = f"server non avviato entro {server_ready_timeout}s (Flask/SocketIO non risponde)"
+                elif _exitcode not in (0, None):
+                    _fail_reason = f"server crashato (exitcode={_exitcode})"
+                else:
+                    _fail_reason = "training completato ma nessun risultato (possibile: loss NaN o metriche non calcolabili)"
+                msg = f"[W{worker_id}] run_summary None per {dataset_name}|{model_name}: {_fail_reason}."
                 print(msg)
                 if telegram_token and telegram_chat_id:
                     send_telegram(telegram_token, telegram_chat_id,
                                   f"<b>⚠️ FCGS run_summary None — Worker {worker_id} ({pc_name})</b>\n"
                                   f"Config: {dataset_name} | {model_name}\n"
-                                  f"Nessun risultato: server crashato o killato.")
+                                  f"Motivo: {_fail_reason}")
+                # Extra backoff after a failure: gives the OS time to release GPU/disk resources
+                # before the next experiment starts, reducing cascading failures.
+                time.sleep(10)
             if os.path.exists(worker_splitting_dir):
                 _safe_rmtree(worker_splitting_dir)
                 print(f"[W{worker_id}] Cleaned up split dir: {worker_splitting_dir}")
-            time.sleep(1)
+            time.sleep(5)
 
             should_notify = False
             with notify_lock:
@@ -795,6 +845,32 @@ def _compute_num_workers(config: dict) -> int:
 
 
 def main():
+    # Bootstrap log: scritto con plain-file prima che il logger Python sia configurato.
+    # Permette di diagnosticare crash precoci (es. Domino11) che avvengono prima della
+    # prima riga di main.log.
+    _pc = PCNAME.name
+    _boot_log_dir = os.path.join(_PROJECT_ROOT, 'log', f'log_{_pc}')
+    try:
+        os.makedirs(_boot_log_dir, exist_ok=True)
+        with open(os.path.join(_boot_log_dir, 'bootstrap.log'), 'a', encoding='utf-8') as _bf:
+            _bf.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} — main() avviato (PID {os.getpid()})\n")
+    except Exception:
+        pass
+
+    try:
+        _main_body()
+    except Exception as _boot_exc:
+        try:
+            import traceback as _tb
+            with open(os.path.join(_boot_log_dir, 'bootstrap.log'), 'a', encoding='utf-8') as _bf:
+                _bf.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} — CRASH FATALE: {_boot_exc}\n"
+                          f"{_tb.format_exc()}\n")
+        except Exception:
+            pass
+        raise
+
+
+def _main_body():
     if not os.path.exists(GRID_SEARCH_CONFIG_PATH):
         print(f"ERRORE: nessun file di configurazione trovato.")
         print(f"        Cercato: {_pc_specific_config}, poi: grid_search_config.json")
