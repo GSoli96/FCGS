@@ -57,41 +57,41 @@ Alienware:
   ssh daisl@alienware "tasklist | findstr python"
 
 ------------------------------------------------------------
-AVVIO PROCESSO FCGS (wmic = detached, sopravvive alla chiusura SSH)
+AVVIO PROCESSO FCGS (Start-Process = detached, sopravvive alla chiusura SSH)
 ------------------------------------------------------------
 
 MSI:
-  ssh giand@msi "wmic process call create \"cmd.exe /c cd /D \"\"C:\Users\giand\Desktop\prog\FCGS\"\" && \"\"venv\Scripts\python.exe\"\" federated_grid_search.py\""
+  ssh giand@msi "powershell Start-Process -FilePath venv\Scripts\python.exe -ArgumentList federated_grid_search.py -WorkingDirectory C:\Users\giand\Desktop\prog\FCGS -WindowStyle Hidden"
 
 MSIDomino12:
-  ssh dastl@domino12 "wmic process call create \"cmd.exe /c cd /D \"\"C:\Users\dastl\Desktop\Giando\FCGS\"\" && \"\"venv\Scripts\python.exe\"\" federated_grid_search.py\""
+  ssh dastl@domino12 "powershell Start-Process -FilePath venv\Scripts\python.exe -ArgumentList federated_grid_search.py -WorkingDirectory C:\Users\dastl\Desktop\Giando\FCGS -WindowStyle Hidden"
 
 MSIDomino11:
-  ssh domin@domino11 "wmic process call create \"cmd.exe /c cd /D \"\"C:\Users\domin\Desktop\prog\FCGS\"\" && \"\"venv\Scripts\python.exe\"\" federated_grid_search.py\""
+  ssh domin@domino11 "powershell Start-Process -FilePath venv\Scripts\python.exe -ArgumentList federated_grid_search.py -WorkingDirectory C:\Users\domin\Desktop\prog\FCGS -WindowStyle Hidden"
 
 Alienware:
-  ssh daisl@alienware "wmic process call create \"cmd.exe /c cd /D \"\"C:\Users\daisl\Desktop\Giando\FCGS\"\" && \"\"venv\Scripts\python.exe\"\" federated_grid_search.py\""
+  ssh daisl@alienware "powershell Start-Process -FilePath venv\Scripts\python.exe -ArgumentList federated_grid_search.py -WorkingDirectory C:\Users\daisl\Desktop\Giando\FCGS -WindowStyle Hidden"
 
 ------------------------------------------------------------
 KILL SOLO PROCESSI FCGS (non tocca altri processi Python)
 ------------------------------------------------------------
 
 Siando (locale):
-  Get-WmiObject Win32_Process -Filter "Name='python.exe'" | Where-Object {$_.CommandLine -like '*federated_grid_search*'} | ForEach-Object {$children = Get-WmiObject Win32_Process -Filter "ParentProcessId=$($_.ProcessId)"; $children | ForEach-Object {Stop-Process -Id $_.ProcessId -Force -EA SilentlyContinue}; Stop-Process -Id $_.ProcessId -Force -EA SilentlyContinue}
+  Get-CimInstance Win32_Process | Where-Object {$_.Name -eq 'python.exe' -and $_.CommandLine -like '*federated_grid_search*'} | ForEach-Object {Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue}
 
 MSI:
-  ssh giand@msi "wmic process where \"Name='python.exe' and CommandLine like '%federated_grid_search%'\" delete"
+  ssh giand@msi 'powershell "Get-CimInstance Win32_Process | Where-Object {$_.Name -eq ''python.exe'' -and $_.CommandLine -like ''*federated_grid_search*''} | ForEach-Object {Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue}"'
 
 MSIDomino12:
-  ssh dastl@domino12 "wmic process where \"Name='python.exe' and CommandLine like '%federated_grid_search%'\" delete"
+  ssh dastl@domino12 'powershell "Get-CimInstance Win32_Process | Where-Object {$_.Name -eq ''python.exe'' -and $_.CommandLine -like ''*federated_grid_search*''} | ForEach-Object {Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue}"'
 
 MSIDomino11:
-  ssh domin@domino11 "wmic process where \"Name='python.exe' and CommandLine like '%federated_grid_search%'\" delete"
+  ssh domin@domino11 'powershell "Get-CimInstance Win32_Process | Where-Object {$_.Name -eq ''python.exe'' -and $_.CommandLine -like ''*federated_grid_search*''} | ForEach-Object {Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue}"'
 
 Alienware:
-  ssh daisl@alienware "wmic process where \"Name='python.exe' and CommandLine like '%federated_grid_search%'\" delete"
+  ssh daisl@alienware 'powershell "Get-CimInstance Win32_Process | Where-Object {$_.Name -eq ''python.exe'' -and $_.CommandLine -like ''*federated_grid_search*''} | ForEach-Object {Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue}"'
 
-NOTA: se wmic lascia worker orfani (processi python.exe in "Services" con tanta RAM),
+NOTA: se rimangono worker orfani (python.exe in Services con tanta RAM),
 killali per PID con: taskkill /F /PID <pid1> /PID <pid2> ...
 
 ------------------------------------------------------------
