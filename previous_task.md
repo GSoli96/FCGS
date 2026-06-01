@@ -1,6 +1,6 @@
 # FCGS — Riepilogo sessioni precedenti
 
-## Stato al 2026-06-01 (aggiornato sera)
+## Stato al 2026-06-01 (sera)
 
 ---
 
@@ -22,50 +22,78 @@ MSIDomino11        : C:\Users\domin\Desktop\prog\FCGS\
 Alienware          : C:\Users\daisl\Desktop\Giando\FCGS\  (hostname: DAIS-RTX-5000-5)
 geosciences        : /home/mldl/itadata/FCGS  (Linux)
 
+# Siando IP (per SCP da altri PC verso Siando)
+172.28.1.52  (rete universitaria)
+100.125.156.12  (Tailscale VPN)
+
 # Comandi completi → PC_Disponibili\Comandi_avvio.txt e comandi_pc.txt
 ```
 
 ---
 
-## Stato esperimenti al 2026-06-01
+## Stato dataset al 2026-06-01 sera
 
-| PC | Stato | CSV | Note |
+| PC | dataset/ | dbluigi/ | Stato |
 |---|---|---|---|
-| **MSI** | FERMO — da riavviare | 460 CSV preservati | Killato per HF rate limit. Pronto al riavvio dopo Domino11 |
-| **MSIDomino12** | FERMO — da riavviare | 0 | Killato per HF rate limit. Pronto al riavvio dopo Domino11 |
-| **MSIDomino11** | **DOWNLOADING** (in corso) | 0 | Download sequenziale di 14 dataset. Avviato alle 12:29 |
-| **Alienware** | PRONTO — non avviato | 0 | Venv Python 3.11 installato, repo clonato |
-| **geosciences** | Stress test in corso (PID 1197781) | — | Avviato alle 15:09, nohup -u, logs in stress_20260601_150937/ |
-| **Siando** | Non monitorato | N/D | |
+| **Siando** | 83.800 file | 31.590 file | Sorgente |
+| **MSI** | copiato da Siando via SCP | copiato | ✓ completo |
+| **Domino12** | in copia via SCP (da Siando) | in copia | in corso |
+| **Domino11** | in copia via SCP (da Siando) | in copia | in corso |
+| **Alienware** | in copia via SCP (da Siando, PID 921) | in copia | in corso |
+| **geosciences** | 22/22 dataset al 100% | 22/22 OK | ✓ completo |
+
+### Verifica dataset geosciences (download_datasets.py --check)
+```
+Tutti i 22 dataset OK al 100% — nessun dataset da scaricare
+```
 
 ---
 
-## Fix applicati in questa sessione (2026-06-01) — tutti committati e pushati
+## Stato esperimenti al 2026-06-01 sera
 
-### Fix 1 — `_adaptive_startup_timeout()` in `federated_grid_search.py`
-- Timeout avvio server adattivo per complessità esperimento
+| PC | Stato | Note |
+|---|---|---|
+| **MSI** | **FCGS IN ESECUZIONE** ✓ | Dataset copiati da Siando, avviata manualmente |
+| **MSIDomino12** | In attesa completamento copia dataset | Poi ricreare venv + avviare |
+| **MSIDomino11** | In attesa completamento copia dataset | Poi ricreare venv + avviare |
+| **Alienware** | In attesa completamento copia dataset | Venv Python 3.11 già installato |
+| **geosciences** | Dataset 100% OK, pronta per avvio | Venv da ricreare senza tenseal |
+| **Siando** | Non monitorato | |
 
-### Fix 2 — Backoff su fallimento
-- `sleep(10)` extra dopo run_summary None + `sleep(5)` fine task
+---
 
-### Fix 3 — GPU cleanup tra le run
-- `torch.cuda.empty_cache()` + `gc.collect()` dopo ogni run
+## Fix applicati in questa sessione (2026-06-01)
 
-### Fix 4 — Bootstrap logging
-- `log/log_{PC}/bootstrap.log` scritto prima del logger Python in `main()`
+### Fix dataset_manager.py
+1. **`_adaptive_startup_timeout()`** — timeout avvio server adattivo
+2. **GPU cleanup** — `torch.cuda.empty_cache()` + `gc.collect()` dopo ogni run
+3. **Backoff su fallimento** — `sleep(10)` extra dopo run_summary None
+4. **Bootstrap logging** — `log/log_{PC}/bootstrap.log` prima del logger Python
+5. **Download timeout** — `_DOWNLOAD_TIMEOUT_S=1800s` con ThreadPoolExecutor
+6. **Fail reason dettagliato** — 3 categorie di errore Telegram
+7. **Download sequenziale su Windows** — forza `parallel=False` per evitare errno 22 HF
+8. **Logging traceback errno 22** — hint MAX_PATH + traceback completo
+9. **Soglia 90% in `_download_folder`** — verifica completezza dopo download (non solo > 0)
 
-### Fix 5 — Timeout per-download
-- `_DOWNLOAD_TIMEOUT_S = 1800s` con `concurrent.futures` timeout
+### Nuovo script: download_datasets.py
+- Progress bar unico per dataset (tqdm, disabilita HF per-file bars)
+- `--token` salva in `.hf_token` per usi futuri
+- `--parallel N` per N dataset simultanei
+- `--check` per solo verifica stato
+- `--force` per riscarica forzata
+- Backoff esponenziale su rate limit 429
 
-### Fix 6 — Messaggi errore dettagliati
-- 3 categorie: server_ready_timeout / exitcode non-zero / NaN metriche
+---
 
-### Fix 7 — Download sequenziale su Windows (nuovo)
-- `dataset_manager.py`: Windows forza `parallel=False` per evitare
-  errno 22 su lock file HuggingFace con download paralleli
+## Token HuggingFace (READ, salvati in .hf_token su ogni PC)
 
-### Fix 8 — Logging traceback errno 22 (nuovo)
-- `dataset_manager.py`: traceback completo + hint per MAX_PATH su errno 22
+| PC | Token salvato |
+|---|---|
+| MSI | ✓ `hf_rhGJzYCW...` |
+| Domino11 | ✓ `hf_UwkfUcMI...` |
+| Domino12 | ✓ `hf_REFmIKmH...` |
+| Alienware | ✓ `hf_xJnztApW...` |
+| geosciences | ✓ `hf_ZxXuuOeB...` |
 
 ---
 
@@ -73,70 +101,54 @@ geosciences        : /home/mldl/itadata/FCGS  (Linux)
 
 ### Alienware (DAIS-RTX-5000-5)
 - **GPU**: RTX 5090 (31.5 GB VRAM)
-- **RAM**: 64 GB
+- **RAM**: 64 GB — **CPU**: Intel Ultra 9 285K 24 core
 - **Config**: `grid_search_config_DAIS-RTX-5000-5.json`
-- **Homomorphic**: SÌ (Python 3.11 installato)
-- **Modelli**: tutti (AlexNet, ConvNet, ResNet18/34/50/101)
-- **Worker**: 4
-- **Venv**: creato, tenseal + torch cu128 installati
-
-### geosciences (aggiornato)
-- **Config**: `grid_search_config_geosciences.json` — rimossa homomorphic
-  (Python 3.12 non compatibile con tenseal 0.3.16)
-- **Stress test**: `run_progressive_test.py --max-workers 8`
-  in esecuzione (PID 1197781, logs in `geosciences_stress_test/`)
+- **Homomorphic**: SÌ — **Worker**: 4 — **Modelli**: tutti
+- **PyTorch**: cu128
+- **Git**: via GitHub Desktop (`C:\Users\daisl\AppData\Local\GitHubDesktop\app-3.5.11\resources\app\git\cmd\git.exe`)
 
 ---
 
-## Problema HuggingFace rate limit
-- Causa: MSI (14 dataset) + Domino12 (5 dataset) scaricavano in parallelo
-  → superato limite 1000 req/5min
-- Fix applicato: download sequenziale su Windows (Fix 7)
-- Soluzione operativa: avviare i PC **uno alla volta**, aspettando che
-  i download finiscano prima di avviare il successivo
+## Comandi avvio (da dentro il PC, sessione SSH)
 
----
+```cmd
+:: Windows — avvio FCGS
+powershell Start-Process -FilePath venv\Scripts\python.exe -ArgumentList federated_grid_search.py -WorkingDirectory %CD% -WindowStyle Hidden
 
-## Comandi avvio corretti (da usare su tutti i PC Windows)
+:: Windows — download dataset
+venv\Scripts\python.exe download_datasets.py --parallel 2
 
-```powershell
-# Avvio (da dentro la sessione SSH del PC)
-powershell Start-Process -FilePath venv\Scripts\python.exe -ArgumentList federated_grid_search.py -WorkingDirectory <PATH_FCGS> -WindowStyle Hidden
+:: Windows — verifica dataset
+venv\Scripts\python.exe download_datasets.py --check
 
-# PID
-powershell Get-Content log\log_<PCNAME>\bootstrap.log
+:: Windows — venv da zero (Python 3.11, cu126 per RTX 3070, cu128 per RTX 5090)
+rmdir /S /Q venv
+py -3.11 -m venv venv
+venv\Scripts\pip install -r requirements_windows.txt
+venv\Scripts\pip install torch torchvision --index-url https://download.pytorch.org/whl/cu126
+```
 
-# Kill FCGS solo
-powershell "Get-CimInstance Win32_Process | Where-Object {$_.Name -eq 'python.exe' -and $_.CommandLine -like '*federated_grid_search*'} | ForEach-Object {Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue}"
+```bash
+# Linux (geosciences) — avvio FCGS
+mkdir -p log/log_geosciences
+nohup python -u federated_grid_search.py > log/log_geosciences/main.log 2>&1 &
+
+# Linux — verifica dataset
+python download_datasets.py --check
+
+# Linux — venv da zero (senza tenseal, cu121)
+rm -rf venv && python3 -m venv venv && source venv/bin/activate
+grep -v "^tenseal" requirements_linux.txt > /tmp/req_geo.txt
+pip install -r /tmp/req_geo.txt
+pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
 ```
 
 ---
 
 ## Cosa fare la prossima sessione
 
-### Quando Domino11 finisce i download
-1. Avviare MSI (460 CSV già presenti, riparte da config 461+)
-2. Avviare Domino12 (riparte da zero)
-3. Avviare Alienware (primo avvio, scaricherà tutti i dataset)
-4. Avviare uno alla volta per non fare rate limit HF
-
-### Stress test geosciences
-5. Analizzare risultati quando PID 1197781 termina:
-   - Report: `geosciences_stress_test/reports/report_*.txt`
-   - Log run: `geosciences_stress_test/logs/stress_20260601_150937/run_w*.log`
-   - Copiare su Siando con SCP
-
-### Monitoraggio
-6. Telegram heartbeat ogni 4h per verificare che i fix funzionino
-7. Verificare che Non ci siano più blocchi a 525/4224 su MSI
-
----
-
-## Note tecniche
-
-- **wmic rimosso su Windows 11 recenti** → usare `Start-Process` per avvio,
-  `Get-CimInstance` per kill
-- **git su Alienware** via GitHub Desktop:
-  `C:\Users\daisl\AppData\Local\GitHubDesktop\app-3.5.11\resources\app\git\cmd\git.exe`
-- **Bootstrap log** salvato in `log/log_{PC}/bootstrap.log` con PID del processo
-- **geosciences nohup**: usare sempre `python -u` per output non bufferizzato
+1. Verificare completamento copia dataset su Domino12, Domino11, Alienware
+2. Ricreare venv su Domino12 e Domino11 (Python 3.11, cu126)
+3. Avviare FCGS su Domino12, Domino11, Alienware, geosciences
+4. Monitorare Telegram heartbeat — verificare che MSI stia girando correttamente
+5. Consolidare CSV quando più PC completano configurazioni
