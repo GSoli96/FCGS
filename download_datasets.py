@@ -134,6 +134,8 @@ def main():
     parser.add_argument('--retries', type=int, default=5, help='Tentativi per dataset (default: 5)')
     parser.add_argument('--timeout', type=int, default=1800, help='Timeout per download in secondi (default: 1800)')
     parser.add_argument('--token', type=str, help='Token HuggingFace (Read). Verrà salvato in .hf_token per usi futuri.')
+    parser.add_argument('--parallel', type=int, default=1, metavar='N',
+                        help='Dataset da scaricare in parallelo (default: 1). Con token dedicato per PC puoi usare 2-3.')
     args = parser.parse_args()
 
     # Salva il token in .hf_token se passato via --token
@@ -198,38 +200,50 @@ def main():
         print("Tutti i dataset sono già completi.")
         return
 
-    print(f"Download di {len(to_download)} dataset (sequenziale per evitare rate limit HF)...\n")
+    n_parallel = args.parallel
+    mode = f"{n_parallel} in parallelo" if n_parallel > 1 else "sequenziale"
+    print(f"Download di {len(to_download)} dataset ({mode}, hf_xet chunk paralleli per file)...\n")
 
     success = 0
     failed_names = []
+    import threading
+    print_lock = threading.Lock()
 
-    outer_bar = tqdm(to_download, unit='dataset', desc='Totale') if _TQDM_OK else to_download
-    for r in outer_bar:
+    def _download_and_report(r, idx):
         ds = r['ds']
         name = ds['name']
         expected = r['expected']
-
-        if _TQDM_OK:
-            outer_bar.set_description(f"{name[:35]}")
-        else:
-            print(f"\n[{to_download.index(r)+1}/{len(to_download)}] {name} ({r['actual']}/{expected})")
-
+        with print_lock:
+            print(f"  [{idx}/{len(to_download)}] Avvio: {name}")
         ok, actual = _download_one(
-            repo_id=repo_id,
-            token=token,
-            ds=ds,
-            max_retries=args.retries,
-            timeout_s=args.timeout,
+            repo_id=repo_id, token=token, ds=ds,
+            max_retries=args.retries, timeout_s=args.timeout,
         )
+        pct = actual / expected * 100 if expected > 0 else (100.0 if actual > 0 else 0.0)
+        with print_lock:
+            tag = 'OK  ' if ok else 'FAIL'
+            print(f"  {tag} {name}: {actual}/{expected} ({pct:.1f}%)")
+        return ok, name
 
-        if ok:
-            success += 1
-            pct = actual / expected * 100 if expected > 0 else 100.0
-            print(f"  OK  {name}: {actual}/{expected} ({pct:.1f}%)")
-        else:
-            failed_names.append(name)
-            pct = actual / expected * 100 if expected > 0 else 0.0
-            print(f"  FAIL {name}: {actual}/{expected} ({pct:.1f}%) — INCOMPLETO dopo {args.retries} tentativi")
+    if n_parallel <= 1:
+        for idx, r in enumerate(to_download, 1):
+            ok, name = _download_and_report(r, idx)
+            if ok:
+                success += 1
+            else:
+                failed_names.append(name)
+    else:
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        with ThreadPoolExecutor(max_workers=n_parallel) as ex:
+            futures = {ex.submit(_download_and_report, r, idx): r
+                       for idx, r in enumerate(to_download, 1)}
+            bar = tqdm(as_completed(futures), total=len(futures), unit='dataset') if _TQDM_OK else as_completed(futures)
+            for fut in bar:
+                ok, name = fut.result()
+                if ok:
+                    success += 1
+                else:
+                    failed_names.append(name)
 
     print(f"\n{'='*60}")
     print(f"Download completato: {success}/{len(to_download)} OK")
