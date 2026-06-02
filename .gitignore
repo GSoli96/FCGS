@@ -192,8 +192,7 @@ logs_errors_warnings.txt
 # Impostazioni locali Claude
 .claude/
 
-# Token HuggingFace — mai committare
-.hf_token
+# Token HuggingFace — il write non va mai nel repo
 .hf_token_write
 
 # Comandi PC con token — mai committare
