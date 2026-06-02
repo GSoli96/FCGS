@@ -388,10 +388,6 @@ class FederatedServer:
         self.logger.info("Client %s is ready and sent data stats.", request.sid)
         self.registered_clients.add(request.sid)
 
-        if 'ckks_public_context' in data and self.ckks_public_context_bytes is None:
-            self.ckks_public_context_bytes = codecs.decode(data['ckks_public_context'].encode(), 'base64')
-            self.logger.info("Received CKKS public context from client.")
-
         samples_per_class = pickle_string_to_object(data['samples_per_class'])
         self.client_stats_buffer.append(samples_per_class)
 

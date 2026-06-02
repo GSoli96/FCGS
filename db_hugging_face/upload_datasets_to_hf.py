@@ -18,8 +18,8 @@ import argparse
 import datetime
 from pathlib import Path
 
-_SCRIPT_DIR = Path(__file__).parent
-_TOKEN_FILE = _SCRIPT_DIR / '.hf_token'
+_SCRIPT_DIR = Path(__file__).parent.parent  # project root
+_TOKEN_FILE = _SCRIPT_DIR / 'setup' / '.hf_token'
 DEFAULT_REPO_ID = 'Siando/fcgs-datasets'
 UPLOAD_FOLDERS = ['dataset', 'dbluigi', 'dbaltri']
 DEFAULT_WORKERS = 24

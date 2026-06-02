@@ -15,8 +15,8 @@ from typing import List, Dict, Optional
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 _SCRIPT_DIR = Path(__file__).parent
-_TOKEN_FILE = _SCRIPT_DIR / '.hf_token'
-_TOKEN_WRITE_FILE = _SCRIPT_DIR / '.hf_token_write'
+_TOKEN_FILE = _SCRIPT_DIR / 'setup' / '.hf_token'
+_TOKEN_WRITE_FILE = _SCRIPT_DIR / 'setup' / '.hf_token_write'
 DEFAULT_REPO_ID = 'Siando/fcgs-datasets'
 
 _IMAGE_EXTENSIONS = {'.jpg', '.jpeg', '.png', '.bmp', '.gif', '.tiff', '.webp'}

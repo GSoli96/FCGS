@@ -19,7 +19,7 @@ import sys
 import time
 from pathlib import Path
 
-_SCRIPT_DIR = Path(__file__).parent
+_SCRIPT_DIR = Path(__file__).parent.parent  # project root
 
 try:
     from tqdm import tqdm
@@ -32,7 +32,7 @@ def _get_hf_token() -> str:
     token = os.environ.get('HF_TOKEN', '').strip()
     if token:
         return token
-    tf = _SCRIPT_DIR / '.hf_token'
+    tf = _SCRIPT_DIR / 'setup' / '.hf_token'
     if tf.exists():
         return tf.read_text().strip()
     return ''
@@ -176,7 +176,7 @@ def main():
 
     # Salva il token in .hf_token se passato via --token
     if args.token:
-        token_file = _SCRIPT_DIR / '.hf_token'
+        token_file = _SCRIPT_DIR / 'setup' / '.hf_token'
         token_file.write_text(args.token.strip(), encoding='utf-8')
         print(f"Token salvato in {token_file}")
 

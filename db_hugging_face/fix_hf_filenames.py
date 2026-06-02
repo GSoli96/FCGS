@@ -20,9 +20,9 @@ import argparse
 from pathlib import Path
 import re
 
-_SCRIPT_DIR = Path(__file__).parent
-_TOKEN_WRITE_FILE = _SCRIPT_DIR / '.hf_token_write'
-_TOKEN_FILE = _SCRIPT_DIR / '.hf_token'
+_SCRIPT_DIR = Path(__file__).parent.parent  # project root
+_TOKEN_WRITE_FILE = _SCRIPT_DIR / 'setup' / '.hf_token_write'
+_TOKEN_FILE = _SCRIPT_DIR / 'setup' / '.hf_token'
 DEFAULT_REPO_ID = 'Siando/fcgs-datasets'
 BATCH_SIZE = 250  # ~102 commit totali per 25330 file — ben sotto il rate limit HF di 128/ora
 

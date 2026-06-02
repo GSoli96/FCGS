@@ -149,7 +149,13 @@ class FederatedClient:
                 time.sleep(0.5)
         except socketio.exceptions.ConnectionError as e:
             self.logger.error("Failed to connect to the server: %s", e)
-            return
+        finally:
+            # Free large objects immediately to avoid RAM accumulation in the long-running worker process.
+            if hasattr(self, 'ckks_context'):
+                self.ckks_context = None
+            if hasattr(self, 'ckks_public_context_bytes'):
+                self.ckks_public_context_bytes = None
+            self.local_model = None
 
     def _register_event_handlers(self) -> None:
         self.sio.on('connect', self._on_connect)
@@ -214,8 +220,6 @@ class FederatedClient:
         samples_per_class = self.local_model.get_samples_per_class()
         self.logger.info("Stats calculated. Sending 'client_ready' to the main server.")
         ready_data = {'samples_per_class': object_to_pickle_string(samples_per_class)}
-        if self.encryption_mode != 'no_encryption' and self.he_backend in ('ckks', 'bfv'):
-            ready_data['ckks_public_context'] = codecs.encode(self.ckks_public_context_bytes, 'base64').decode()
         if not self.sio.connected:
             self.logger.error("Connection lost before sending 'client_ready'. Aborting.")
             return

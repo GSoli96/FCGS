@@ -8,11 +8,11 @@
   "heartbeat_interval_hours": 4,
   "gpu_blacklist": [],
   "num_parallel_executions": 1,
-  "base_csv_path": "csv",
-  "base_log_path": "log",
+  "base_csv_path": "results/csv",
+  "base_log_path": "results/log",
   "heavy_client_threshold": 8,
   "base_plot_path": "static/plots",
-  "base_split_data_path": "run_dataset",
+  "base_split_data_path": "results/run_dataset",
   "round_timeout": 1800,
   "server_startup_timeout": 600,
   "server_ready_timeout": 180,
@@ -143,14 +143,26 @@
     {
       "name": "dataset_RD_colored",
       "path": "dbluigi/dataset_RD/colored_images",
-      "num_classes": 5,
-      "num_images": 3662
+      "num_classes": 3,
+      "num_images": 1562
+    },
+    {
+      "name": "dataset_RD_colored_1",
+      "path": "dbluigi/dataset_RD/colored_images_1",
+      "num_classes": 2,
+      "num_images": 2100
     },
     {
       "name": "dataset_RD_kdr299",
       "path": "dbluigi/dataset_RD/kdr299_iimp",
-      "num_classes": 5,
-      "num_images": 3662
+      "num_classes": 3,
+      "num_images": 1562
+    },
+    {
+      "name": "dataset_RD_kdr299_1",
+      "path": "dbluigi/dataset_RD/kdr299_iimp_1",
+      "num_classes": 2,
+      "num_images": 2100
     }
   ],
   "common_search_space": {

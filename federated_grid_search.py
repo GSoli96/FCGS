@@ -32,8 +32,9 @@ NUM_PARALLEL_EXECUTIONS = 20
 HEAVY_CLIENT_THRESHOLD = 8
 
 _PROJECT_ROOT = Path(__file__).parent
-_pc_specific_config = f'grid_search_config_{PCNAME.name}.json'
-GRID_SEARCH_CONFIG_PATH = _pc_specific_config if os.path.exists(_pc_specific_config) else 'grid_search_config.json'
+_CONFIGS_DIR = _PROJECT_ROOT / 'configs'
+_pc_specific_config = str(_CONFIGS_DIR / f'grid_search_config_{PCNAME.name}.json')
+GRID_SEARCH_CONFIG_PATH = _pc_specific_config if os.path.exists(_pc_specific_config) else str(_CONFIGS_DIR / 'grid_search_config.json')
 VERBOSE_DUPLICATE_CHECK = False
 
 
@@ -849,13 +850,22 @@ def main():
     # Permette di diagnosticare crash precoci (es. Domino11) che avvengono prima della
     # prima riga di main.log.
     _pc = PCNAME.name
-    _boot_log_dir = os.path.join(_PROJECT_ROOT, 'log', f'log_{_pc}')
+    _boot_log_dir = os.path.join(_PROJECT_ROOT, 'results', 'log', f'log_{_pc}')
     try:
         os.makedirs(_boot_log_dir, exist_ok=True)
         with open(os.path.join(_boot_log_dir, 'bootstrap.log'), 'a', encoding='utf-8') as _bf:
             _bf.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} — main() avviato (PID {os.getpid()})\n")
     except Exception:
         pass
+
+    # Fix: stdout invalido con Start-Process -WindowStyle Hidden.
+    # Se flush() fallisce l'handle è rotto → reindirizziamo a devnull.
+    # L'output utile va già su main.log tramite il logger, quindi non perdiamo nulla.
+    try:
+        sys.stdout.flush()
+    except OSError:
+        sys.stdout = open(os.devnull, 'w')
+        sys.stderr = open(os.devnull, 'w')
 
     try:
         _main_body()

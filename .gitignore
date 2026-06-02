@@ -158,6 +158,10 @@ simulated_FL.py
 /yolo_benchmark/yolo_training/
 
 # Dataset e output di runtime — non nel repo
+# Nuovi path dopo riorganizzazione in results/
+results/log/
+results/run_dataset/
+
 dataset/
 dbluigi/
 run_dataset*/
@@ -193,4 +197,5 @@ logs_errors_warnings.txt
 .hf_token_write
 
 # Comandi PC con token — mai committare
+comandi_pc.txt
 Comandi_pc.txt
