@@ -1,26 +1,32 @@
 """
-download_datasets.py — Scarica tutti i dataset mancanti/incompleti con progress bar.
+download_datasets.py — Scarica dataset da HuggingFace in parallelo, senza rate limit.
+
+Strategia anti-rate-limit:
+  - list_repo_tree() UNA volta per dataset  → poche chiamate API paginate (~5-10)
+  - Download via URL CDN diretti             → non contano nel rate limit API
+  - Thread pool per file paralleli           → massima velocità di download
+
+Il vecchio approccio (snapshot_download) faceva una richiesta HEAD per ogni file:
+5000 immagini = 5000 richieste API → rate limit 429 immediato.
 
 Uso:
-    python download_datasets.py                          # usa config del PC corrente
-    python download_datasets.py --config <file.json>     # config esplicita
-    python download_datasets.py --force                  # riscarica anche dataset già OK
-    python download_datasets.py --check                  # solo verifica, non scarica
-
-Il download è sempre SEQUENZIALE per evitare rate limit HuggingFace (1000 req/5min per token).
-Ogni PC dovrebbe avere il proprio token HF per avere quota indipendente:
-  - Crea token su https://huggingface.co/settings/tokens (tipo: Read)
-  - Salvalo in .hf_token nella cartella FCGS oppure come variabile HF_TOKEN
+    python download_datasets.py                    # config automatica per PC corrente
+    python download_datasets.py --config FILE      # config esplicita
+    python download_datasets.py --check            # solo verifica stato locale
+    python download_datasets.py --force            # riscarica anche file già presenti
+    python download_datasets.py --workers N        # worker paralleli (default: 8)
+    python download_datasets.py --token hf_xxx     # token HuggingFace
 """
 import argparse
 import json
 import os
 import sys
-import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
+from threading import Lock
 
-_SCRIPT_DIR = Path(__file__).parent.parent  # project root
+_SCRIPT_DIR = Path(__file__).parent.parent
 if str(_SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(_SCRIPT_DIR))
 
@@ -41,16 +47,6 @@ def _get_hf_token() -> str:
     return ''
 
 
-def _count_images(path: str) -> int:
-    from dataset_manager import _count_images as _ci
-    return _ci(path)
-
-
-def _load_config(config_path: Path) -> dict:
-    with open(config_path, encoding='utf-8') as f:
-        return json.load(f)
-
-
 def _find_config() -> Path:
     import PCNAME
     pc = PCNAME.name
@@ -64,119 +60,145 @@ def _find_config() -> Path:
     raise FileNotFoundError(f"Nessun config trovato per PC '{pc}'")
 
 
-def _download_one(repo_id: str, token: str, ds: dict, attempt: int = 1, max_retries: int = 5,
-                  timeout_s: int = 1800) -> tuple[bool, int]:
+def _count_images(path: str) -> int:
+    from dataset_manager import _count_images as _ci
+    return _ci(path)
+
+
+def _list_remote_files(api, repo_id: str, path_in_repo: str, token: str) -> list:
     """
-    Scarica un singolo dataset con progress bar sui file.
-    Ritorna (successo, immagini_finali).
+    Lista tutti i file (RepoFile) sotto path_in_repo nel repo HuggingFace.
+    Fa poche chiamate API paginate — non dipende dal numero di file.
     """
-    import concurrent.futures
-    from huggingface_hub import snapshot_download
+    from huggingface_hub.hf_api import RepoFile
+    files = []
+    for item in api.list_repo_tree(
+        repo_id=repo_id,
+        repo_type='dataset',
+        path_in_repo=path_in_repo,
+        recursive=True,
+        token=token,
+    ):
+        if isinstance(item, RepoFile):
+            files.append(item)
+    return files
+
+
+def _download_file(session, url: str, local_path: Path, max_retries: int = 5) -> bool:
+    """
+    Scarica un file via CDN diretto. Gestisce retry e rate limit.
+    Non conta nel rate limit API HuggingFace (è una richiesta CDN).
+    """
+    local_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = local_path.with_suffix(local_path.suffix + '.tmp')
+
+    for attempt in range(1, max_retries + 1):
+        try:
+            with session.get(url, stream=True, timeout=120) as r:
+                if r.status_code == 429:
+                    wait = 30 * attempt
+                    time.sleep(wait)
+                    continue
+                r.raise_for_status()
+                with open(tmp_path, 'wb') as f:
+                    for chunk in r.iter_content(chunk_size=131072):
+                        f.write(chunk)
+            tmp_path.rename(local_path)
+            return True
+        except Exception:
+            if tmp_path.exists():
+                tmp_path.unlink(missing_ok=True)
+            if attempt < max_retries:
+                time.sleep(5 * attempt)
+
+    return False
+
+
+def _download_dataset(
+    api, repo_id: str, ds: dict, token: str,
+    workers: int, force: bool, print_lock: Lock,
+) -> tuple[bool, int, int]:
+    """
+    Scarica un dataset completo.
+    Ritorna (successo, file_scaricati, file_totali_remoti).
+    """
+    import requests
 
     hf_path = ds['path'].replace('\\', '/')
-    expected = ds.get('num_images', 0)
-    patterns = [f"{hf_path}/*", f"{hf_path}/**/*"]
+    name = ds['name']
 
-    for att in range(1, max_retries + 1):
-        try:
-            def _do():
-                # Disabilita i progress bar interni di HuggingFace (uno per file).
-                # Usiamo il nostro progress bar unico per dataset.
-                try:
-                    import huggingface_hub.utils as _hfu
-                    _hfu.disable_progress_bars()
-                except Exception:
-                    pass
-                snapshot_download(
-                    repo_id=repo_id,
-                    repo_type='dataset',
-                    token=token,
-                    local_dir=str(_SCRIPT_DIR),
-                    allow_patterns=patterns,
-                    ignore_patterns=['*.gitattributes'],
-                    max_workers=4,
-                )
+    with print_lock:
+        print(f"  [{name}] listing file remoti...", flush=True)
 
-            # Progress bar che mostra immagini scaricate durante il download
-            start_count = _count_images(hf_path)
-            bar = None
-            stop_monitor = threading.Event()
+    try:
+        remote_files = _list_remote_files(api, repo_id, hf_path, token)
+    except Exception as e:
+        with print_lock:
+            print(f"  [{name}] ERRORE listing: {e}", flush=True)
+        return False, 0, 0
 
-            def _monitor():
-                nonlocal bar
-                if _TQDM_OK and expected > 0:
-                    bar = tqdm(total=expected, initial=start_count,
-                               desc=f"  {hf_path.split('/')[-1][:30]}",
-                               unit='img', leave=False, dynamic_ncols=True)
-                    last = start_count
-                    while not stop_monitor.is_set():
-                        cur = _count_images(hf_path)
-                        if cur > last:
-                            bar.update(cur - last)
-                            last = cur
-                        stop_monitor.wait(timeout=2)
-                    cur = _count_images(hf_path)
-                    if cur > last:
-                        bar.update(cur - last)
-                    bar.close()
+    # Calcola quali file mancano o sono corrotti (size 0)
+    to_download = []
+    for rf in remote_files:
+        local_path = _SCRIPT_DIR / rf.path
+        needs_dl = force or not local_path.exists() or local_path.stat().st_size == 0
+        if needs_dl:
+            to_download.append(rf)
 
-            mon = threading.Thread(target=_monitor, daemon=True)
-            mon.start()
+    already = len(remote_files) - len(to_download)
+    with print_lock:
+        print(
+            f"  [{name}] {len(remote_files)} remoti | {already} già presenti | "
+            f"{len(to_download)} da scaricare",
+            flush=True,
+        )
 
-            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
-                fut = ex.submit(_do)
-                try:
-                    fut.result(timeout=timeout_s)
-                except concurrent.futures.TimeoutError:
-                    stop_monitor.set()
-                    mon.join(timeout=3)
-                    print(f"    TIMEOUT dopo {timeout_s}s (tentativo {att}/{max_retries})")
-                    if att < max_retries:
-                        time.sleep(30 * att)
-                    continue
+    if not to_download:
+        return True, 0, len(remote_files)
 
-            stop_monitor.set()
-            mon.join(timeout=3)
+    base_url = f"https://huggingface.co/datasets/{repo_id}/resolve/main"
+    session = requests.Session()
+    session.headers.update({"Authorization": f"Bearer {token}"})
 
-            actual = _count_images(hf_path)
-            if expected > 0 and actual < expected:
-                print(f"    Incompleto: {actual}/{expected} ({actual/expected*100:.1f}%) "
-                      f"— tentativo {att}/{max_retries}")
-                if att < max_retries:
-                    time.sleep(30 * att)
-                continue
-            return True, actual
+    ok_count = 0
+    fail_count = 0
+    bar = tqdm(total=len(to_download), desc=f"  {name[:35]}", unit='file', leave=True) if _TQDM_OK else None
+    bar_lock = Lock()
 
-        except Exception as e:
-            err_str = str(e)
-            if '429' in err_str:
-                # Rate limit HF: attesa esponenziale — 60s, 120s, 180s, ...
-                wait = 60 * att
-                print(f"    Rate limit HF (429) — attendo {wait}s (tentativo {att}/{max_retries})")
-                print(f"    SUGGERIMENTO: usa un token HF diverso per questo PC")
-                time.sleep(wait)
+    def _dl(rf):
+        url = f"{base_url}/{rf.path}"
+        local_path = _SCRIPT_DIR / rf.path
+        return _download_file(session, url, local_path), rf.path
+
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        futures = {ex.submit(_dl, rf): rf for rf in to_download}
+        for fut in as_completed(futures):
+            ok, path = fut.result()
+            if ok:
+                ok_count += 1
             else:
-                print(f"    ERRORE: {e} (tentativo {att}/{max_retries})")
-                if att < max_retries:
-                    time.sleep(30 * att)
+                fail_count += 1
+                with print_lock:
+                    print(f"\n  FAIL: {path}", flush=True)
+            if bar:
+                with bar_lock:
+                    bar.update(1)
 
-    actual = _count_images(hf_path)
-    return False, actual
+    if bar:
+        bar.close()
+
+    return fail_count == 0, ok_count, len(remote_files)
 
 
 def main():
-    parser = argparse.ArgumentParser(description='Scarica dataset FCGS con progress bar')
-    parser.add_argument('--config', type=str, help='Path al config JSON (default: auto)')
-    parser.add_argument('--force', action='store_true', help='Riscarica anche dataset già OK')
-    parser.add_argument('--check', action='store_true', help='Solo verifica stato, non scarica')
-    parser.add_argument('--retries', type=int, default=5, help='Tentativi per dataset (default: 5)')
-    parser.add_argument('--timeout', type=int, default=1800, help='Timeout per download in secondi (default: 1800)')
-    parser.add_argument('--token', type=str, help='Token HuggingFace (Read). Verrà salvato in .hf_token per usi futuri.')
-    parser.add_argument('--parallel', type=int, default=1, metavar='N',
-                        help='Dataset da scaricare in parallelo (default: 1). Con token dedicato per PC puoi usare 2-3.')
+    parser = argparse.ArgumentParser(description='Scarica dataset FCGS da HuggingFace senza rate limit')
+    parser.add_argument('--config', type=str, help='Path config JSON (default: auto per PC)')
+    parser.add_argument('--force', action='store_true', help='Riscarica anche file già presenti')
+    parser.add_argument('--check', action='store_true', help='Solo verifica stato locale, non scarica')
+    parser.add_argument('--workers', type=int, default=8, help='Worker paralleli per file (default: 8)')
+    parser.add_argument('--token', type=str, help='Token HuggingFace Read. Salvato in setup/.hf_token.')
     args = parser.parse_args()
 
-    # Salva il token in .hf_token se passato via --token
     if args.token:
         token_file = _SCRIPT_DIR / 'setup' / '.hf_token'
         token_file.write_text(args.token.strip(), encoding='utf-8')
@@ -185,7 +207,9 @@ def main():
     config_path = Path(args.config) if args.config else _find_config()
     print(f"Config: {config_path.name}")
 
-    config = _load_config(config_path)
+    with open(config_path, encoding='utf-8') as f:
+        config = json.load(f)
+
     datasets = config.get('datasets', [])
     repo_id = config.get('hf_repo_id', 'Siando/fcgs-datasets')
 
@@ -197,100 +221,82 @@ def main():
     if not token:
         print("ERRORE: token HuggingFace non trovato.")
         print("  Usa: python download_datasets.py --token hf_xxxxxxxxxxxx")
-        print("  Oppure crea .hf_token nella cartella FCGS")
-        print("  Token: https://huggingface.co/settings/tokens (tipo: Read)")
+        print("  Token Read: https://huggingface.co/settings/tokens")
         sys.exit(1)
-    print(f"Token HF: {token[:8]}...{token[-4:]}")
-    print(f"Repo: {repo_id}")
-    print(f"Totale dataset nel config: {len(datasets)}\n")
 
-    # Verifica stato attuale
-    results = []
+    print(f"Token: {token[:8]}...{token[-4:]}")
+    print(f"Repo:  {repo_id}")
+    print(f"Dataset nel config: {len(datasets)}\n")
+
+    # Verifica stato locale
     print("Verifica stato dataset locali...")
-    bar = tqdm(datasets, unit='dataset') if _TQDM_OK else datasets
-    for ds in bar:
+    results = []
+    ds_bar = tqdm(datasets, unit='dataset') if _TQDM_OK else datasets
+    for ds in ds_bar:
         actual = _count_images(ds['path'])
         expected = ds.get('num_images', 0)
-        if expected > 0:
-            pct = actual / expected * 100
-            ok = actual >= expected * 0.9
-        else:
-            pct = 100.0 if actual > 0 else 0.0
-            ok = actual > 0
+        pct = actual / expected * 100 if expected > 0 else (100.0 if actual > 0 else 0.0)
+        ok = (actual >= expected * 0.9) if expected > 0 else (actual > 0)
         results.append({'ds': ds, 'actual': actual, 'expected': expected, 'ok': ok, 'pct': pct})
 
     print()
-    ok_count = sum(1 for r in results if r['ok'])
-    fail_count = len(results) - ok_count
-    print(f"{'Dataset':<45} {'Stato':<8} {'Trovate':>8} {'Attese':>8} {'%':>6}")
+    ok_n = sum(1 for r in results if r['ok'])
+    print(f"{'Dataset':<45} {'Stato':<10} {'Locali':>8} {'Attese':>8} {'%':>6}")
     print('-' * 80)
     for r in results:
         status = 'OK' if r['ok'] else 'INCOMPLETO'
-        print(f"{r['ds']['name']:<45} {status:<8} {r['actual']:>8} {r['expected']:>8} {r['pct']:>5.1f}%")
+        print(f"{r['ds']['name']:<45} {status:<10} {r['actual']:>8} {r['expected']:>8} {r['pct']:>5.1f}%")
     print('-' * 80)
-    print(f"Totale: {ok_count} OK, {fail_count} da scaricare\n")
+    print(f"Totale: {ok_n} OK, {len(results) - ok_n} da scaricare\n")
 
     if args.check:
         return
 
-    to_download = [r for r in results if not r['ok'] or args.force]
-    if not to_download:
+    to_dl = [r for r in results if not r['ok'] or args.force]
+    if not to_dl:
         print("Tutti i dataset sono già completi.")
         return
 
-    n_parallel = args.parallel
-    mode = f"{n_parallel} in parallelo" if n_parallel > 1 else "sequenziale"
-    print(f"Download di {len(to_download)} dataset ({mode}, hf_xet chunk paralleli per file)...\n")
+    print(f"Download {len(to_dl)} dataset con {args.workers} worker paralleli per file...")
+    print("(list_repo_tree = poche chiamate API; download via CDN = nessun rate limit)\n")
 
-    success = 0
+    from huggingface_hub import HfApi
+    api = HfApi()
+
+    print_lock = Lock()
+    total_ok = 0
     failed_names = []
-    print_lock = threading.Lock()
 
-    def _download_and_report(r, idx):
+    for i, r in enumerate(to_dl, 1):
         ds = r['ds']
-        name = ds['name']
-        expected = r['expected']
-        with print_lock:
-            print(f"  [{idx}/{len(to_download)}] Avvio: {name}")
-        ok, actual = _download_one(
-            repo_id=repo_id, token=token, ds=ds,
-            max_retries=args.retries, timeout_s=args.timeout,
+        print(f"[{i}/{len(to_dl)}] {ds['name']}", flush=True)
+
+        ok, downloaded, total_remote = _download_dataset(
+            api=api, repo_id=repo_id, ds=ds,
+            token=token, workers=args.workers,
+            force=args.force, print_lock=print_lock,
         )
-        pct = actual / expected * 100 if expected > 0 else (100.0 if actual > 0 else 0.0)
-        with print_lock:
-            tag = 'OK  ' if ok else 'FAIL'
-            print(f"  {tag} {name}: {actual}/{expected} ({pct:.1f}%)")
-        return ok, name
 
-    if n_parallel <= 1:
-        for idx, r in enumerate(to_download, 1):
-            ok, name = _download_and_report(r, idx)
-            if ok:
-                success += 1
-            else:
-                failed_names.append(name)
-    else:
-        from concurrent.futures import ThreadPoolExecutor, as_completed
-        with ThreadPoolExecutor(max_workers=n_parallel) as ex:
-            futures = {ex.submit(_download_and_report, r, idx): r
-                       for idx, r in enumerate(to_download, 1)}
-            bar = tqdm(as_completed(futures), total=len(futures), unit='dataset') if _TQDM_OK else as_completed(futures)
-            for fut in bar:
-                ok, name = fut.result()
-                if ok:
-                    success += 1
-                else:
-                    failed_names.append(name)
+        actual_now = _count_images(ds['path'])
+        pct = actual_now / ds.get('num_images', 1) * 100
 
-    print(f"\n{'='*60}")
-    print(f"Download completato: {success}/{len(to_download)} OK")
+        tag = 'OK  ' if ok else 'FAIL'
+        print(f"  {tag} {ds['name']}: {actual_now}/{ds.get('num_images',0)} immagini ({pct:.1f}%)\n", flush=True)
+
+        if ok:
+            total_ok += 1
+        else:
+            failed_names.append(ds['name'])
+
+    print('=' * 60)
+    print(f"Download completato: {total_ok}/{len(to_dl)} OK")
     if failed_names:
         print(f"Falliti ({len(failed_names)}): {', '.join(failed_names)}")
         print("\nSuggerimenti:")
-        print("  - Usa un token HF diverso per questo PC (rate limit per token)")
-        print("  - Aspetta qualche minuto e riprova con: python download_datasets.py")
-        print("  - Controlla che il token abbia accesso al repo Siando/fcgs-datasets")
-    print(f"{'='*60}")
+        print("  - Riprova con: python download_datasets.py")
+        print("  - Aumenta i worker: --workers 16")
+        print("  - Verifica accesso al repo con il token")
+    print('=' * 60)
 
 
 if __name__ == '__main__':
