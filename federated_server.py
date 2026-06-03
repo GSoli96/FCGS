@@ -118,7 +118,18 @@ class FederatedServer:
         log_dir = os.path.join(log_dir_base, datestr, "FL-Server-LOG")
         os.makedirs(log_dir, exist_ok=True)
 
-        fh = logging.FileHandler(os.path.join(log_dir, f'{timestr}.log'))
+        log_path = os.path.join(log_dir, f'{timestr}.log')
+        # Write a startup marker before the FileHandler is attached so that even a
+        # SEGFAULT in a C extension (e.g. CUDA OOM) leaves a non-empty log file.
+        try:
+            with open(log_path, 'w', encoding='utf-8') as _lf:
+                _lf.write(f"[startup] {time.strftime('%Y-%m-%d %H:%M:%S')} "
+                          f"dataset={self.config.get('dataset_name')} "
+                          f"model={self.config.get('model_name')} "
+                          f"worker={self.config.get('worker_id')}\n")
+        except Exception:
+            pass
+        fh = logging.FileHandler(log_path, mode='a', encoding='utf-8')
         fh.setLevel(logging.INFO)
 
         ch = logging.StreamHandler()

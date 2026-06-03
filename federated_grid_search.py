@@ -404,6 +404,11 @@ def generate_configurations(base_config: Dict, search_space: Dict) -> Generator[
 
 def _server_process_target(config: Dict, result_queue: multiprocessing.Queue) -> None:
     """Gira il FederatedServer in un subprocess separato e mette run_summary nella queue."""
+    # Prepare crash log path before FederatedServer init so early crashes are visible
+    # (server log file stays 0 bytes on Windows if the process dies before the first flush).
+    _log_dir_base = config.get('log_dir', 'logs')
+    _crash_log = os.path.join(_log_dir_base, time.strftime('%d%m'),
+                              'FL-Server-LOG', f'{time.strftime("%m%d%H%M")}_crash.log')
     try:
         server = federated_server.FederatedServer(config)
         try:
@@ -412,10 +417,26 @@ def _server_process_target(config: Dict, result_queue: multiprocessing.Queue) ->
             # _shutdown_server usa ctypes per sollevare SystemExit nel thread main
             # del subprocess. Lo catturiamo per poter ancora salvare i risultati.
             pass
+        # Safety net: if _shutdown_server's emergency save didn't run (e.g. killed before
+        # it could complete), save partial results here before returning to the worker.
+        if server.aggregator.run_summary is None and server.aggregator.metrics_history:
+            try:
+                server.aggregator.save_results()
+            except Exception:
+                pass
         run_summary = server.aggregator.get_run_summary()
         result_queue.put(run_summary)
     except Exception as e:
-        print(f"[ServerProc W{config.get('worker_id','?')}] Error: {e}\n{traceback.format_exc()}")
+        tb = traceback.format_exc()
+        print(f"[ServerProc W{config.get('worker_id','?')}] Error: {e}\n{tb}")
+        try:
+            os.makedirs(os.path.dirname(_crash_log), exist_ok=True)
+            with open(_crash_log, 'w', encoding='utf-8') as _cf:
+                _cf.write(f"SERVER CRASH — {time.strftime('%Y-%m-%d %H:%M:%S')}\n"
+                          f"Dataset: {config.get('dataset_name')} | Model: {config.get('model_name')}\n"
+                          f"Worker: {config.get('worker_id')}\n\n{tb}")
+        except Exception:
+            pass
         result_queue.put(None)
 
 
@@ -1028,14 +1049,30 @@ def _main_body():
             download_ok = check_and_download_datasets_parallel(
                 download_config, max_parallel=2, logger=_main_logger)
         if not download_ok:
-            msg = "Download dataset fallito dopo tutti i tentativi. Processo terminato."
-            _main_logger.error(f"[FCGS] ERRORE FATALE: {msg}")
+            # Identify which dataset paths are actually missing so we can skip only those configs.
+            from dataset_manager import _dataset_exists as _has_imgs
+            failed_paths = {ds['path'] for ds in datasets_to_download
+                            if not _has_imgs(os.path.join(str(_PROJECT_ROOT), ds['path']))}
+            _main_logger.warning(
+                f"[FCGS] Download incompleto per {len(failed_paths)} dataset: {failed_paths}. "
+                "Le config corrispondenti saranno saltate, le altre continuano.")
             _tok = base_grid_config.get('telegram_bot_token', '')
             _cid = base_grid_config.get('telegram_chat_id', '')
             send_telegram(_tok, _cid,
-                          f"<b>⚠️ FCGS ERRORE — {pc_name}</b>\n{msg}",
+                          f"<b>⚠️ FCGS Download parziale — {pc_name}</b>\n"
+                          f"Dataset non disponibili ({len(failed_paths)}): {failed_paths}\n"
+                          "Le altre configurazioni continuano normalmente.",
                           logger=_main_logger)
-            sys.exit(1)
+            # Remove configs for unavailable datasets; update counts accordingly.
+            before = len(pending_configs)
+            pending_configs = [c for c in pending_configs if c['dataset_path'] not in failed_paths]
+            configs_to_run_count = len(pending_configs)
+            _main_logger.warning(
+                f"[FCGS] Rimosse {before - configs_to_run_count} config per dataset mancanti. "
+                f"Rimangono {configs_to_run_count} config da eseguire.")
+            if not pending_configs:
+                _main_logger.error("[FCGS] Nessuna configurazione rimasta dopo la rimozione dei dataset falliti.")
+                sys.exit(1)
 
     for hyper_config in pending_configs:
         task_queue.put(hyper_config)
