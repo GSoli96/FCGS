@@ -146,7 +146,7 @@
       "name": "dataset_RD_colored",
       "path": "dbluigi/dataset_RD/colored_images",
       "num_classes": 3,
-      "num_images": 3662
+      "num_images": 1562
     },
     {
       "name": "dataset_RD_colored_1",
