@@ -16,10 +16,13 @@ import argparse
 import json
 import os
 import sys
+import threading
 import time
 from pathlib import Path
 
 _SCRIPT_DIR = Path(__file__).parent.parent  # project root
+if str(_SCRIPT_DIR) not in sys.path:
+    sys.path.insert(0, str(_SCRIPT_DIR))
 
 try:
     from tqdm import tqdm
@@ -32,9 +35,9 @@ def _get_hf_token() -> str:
     token = os.environ.get('HF_TOKEN', '').strip()
     if token:
         return token
-    tf = _SCRIPT_DIR / 'setup' / '.hf_token'
-    if tf.exists():
-        return tf.read_text().strip()
+    for tf in (_SCRIPT_DIR / 'setup' / '.hf_token', _SCRIPT_DIR / '.hf_token'):
+        if tf.exists():
+            return tf.read_text().strip()
     return ''
 
 
@@ -52,8 +55,8 @@ def _find_config() -> Path:
     import PCNAME
     pc = PCNAME.name
     candidates = [
-        _SCRIPT_DIR / f'grid_search_config_{pc}.json',
-        _SCRIPT_DIR / 'grid_search_config.json',
+        _SCRIPT_DIR / 'configs' / f'grid_search_config_{pc}.json',
+        _SCRIPT_DIR / 'configs' / 'grid_search_config.json',
     ]
     for c in candidates:
         if c.exists():
@@ -117,8 +120,7 @@ def _download_one(repo_id: str, token: str, ds: dict, attempt: int = 1, max_retr
                         bar.update(cur - last)
                     bar.close()
 
-            import threading as _th
-            mon = _th.Thread(target=_monitor, daemon=True)
+            mon = threading.Thread(target=_monitor, daemon=True)
             mon.start()
 
             with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
@@ -242,7 +244,6 @@ def main():
 
     success = 0
     failed_names = []
-    import threading
     print_lock = threading.Lock()
 
     def _download_and_report(r, idx):

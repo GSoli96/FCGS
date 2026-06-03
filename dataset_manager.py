@@ -16,7 +16,9 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 _SCRIPT_DIR = Path(__file__).parent
 _TOKEN_FILE = _SCRIPT_DIR / 'setup' / '.hf_token'
+_TOKEN_FILE_ROOT = _SCRIPT_DIR / '.hf_token'          # fallback: root del progetto
 _TOKEN_WRITE_FILE = _SCRIPT_DIR / 'setup' / '.hf_token_write'
+_TOKEN_WRITE_FILE_ROOT = _SCRIPT_DIR / '.hf_token_write'
 DEFAULT_REPO_ID = 'Siando/fcgs-datasets'
 
 _IMAGE_EXTENSIONS = {'.jpg', '.jpeg', '.png', '.bmp', '.gif', '.tiff', '.webp'}
@@ -26,8 +28,9 @@ def _get_hf_token() -> Optional[str]:
     token = os.environ.get('HF_TOKEN', '').strip()
     if token:
         return token
-    if _TOKEN_FILE.exists():
-        return _TOKEN_FILE.read_text().strip()
+    for tf in (_TOKEN_FILE, _TOKEN_FILE_ROOT):
+        if tf.exists():
+            return tf.read_text().strip()
     return None
 
 
@@ -35,8 +38,9 @@ def _get_hf_token_write() -> Optional[str]:
     token = os.environ.get('HF_TOKEN_WRITE', '').strip()
     if token:
         return token
-    if _TOKEN_WRITE_FILE.exists():
-        return _TOKEN_WRITE_FILE.read_text().strip()
+    for tf in (_TOKEN_WRITE_FILE, _TOKEN_WRITE_FILE_ROOT):
+        if tf.exists():
+            return tf.read_text().strip()
     return _get_hf_token()
 
 
