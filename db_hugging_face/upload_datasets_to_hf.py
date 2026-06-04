@@ -8,9 +8,14 @@ Uso:
     python upload_datasets_to_hf.py                    # carica tutto
     python upload_datasets_to_hf.py --only dataset     # solo dataset/
     python upload_datasets_to_hf.py --only dbluigi     # solo dbluigi/
-    python upload_datasets_to_hf.py --workers 32       # piu' parallelismo
+    python upload_datasets_to_hf.py --workers 4        # worker paralleli
 
 Token: variabile HF_TOKEN oppure file .hf_token (deve avere permessi write)
+
+Rate limit HuggingFace (piano Free, finestre da 5 minuti):
+  - Hub API (commit, list): 1.000 req/5min  → max ~3 req/sec
+  - Resolver (CDN download): 5.000 req/5min → max ~17 req/sec
+  Con DEFAULT_WORKERS = 4 si restano ampiamente sotto i limiti.
 """
 import os
 import sys
@@ -22,7 +27,7 @@ _SCRIPT_DIR = Path(__file__).parent.parent  # project root
 _TOKEN_FILE = _SCRIPT_DIR / 'setup' / '.hf_token'
 DEFAULT_REPO_ID = 'Siando/fcgs-datasets'
 UPLOAD_FOLDERS = ['dataset', 'dbluigi', 'dbaltri']
-DEFAULT_WORKERS = 24
+DEFAULT_WORKERS = 4
 
 
 def get_token(cli_token: str) -> str:
@@ -58,36 +63,33 @@ def upload_with_large_folder(api, folders: list, repo_id: str, token: str, num_w
     upload_large_folder non supporta path_in_repo, quindi partiamo dalla root
     e filtriamo con allow_patterns — cosi' i path nel repo sono identici ai path locali.
     """
-    # Costruisci allow_patterns per le cartelle richieste
-    patterns = []
-    for folder in folders:
-        patterns.append(f"{folder}/**")
+    import logging
+    logging.getLogger("huggingface_hub").setLevel(logging.ERROR)
 
-    # Info dimensione
-    total_files = 0
-    total_mb = 0.0
-    for folder in folders:
-        fp = _SCRIPT_DIR / folder
-        if fp.exists():
-            n, mb = count_folder(fp)
-            total_files += n
-            total_mb += mb
-            print(f"  {folder}/: {n:,} file, {mb:.0f} MB")
+    patterns = [f"{folder}/**" for folder in folders]
 
-    print(f"\nTotale: {total_files:,} file, {total_mb:.0f} MB ({total_mb/1024:.1f} GB)")
-    print(f"Workers: {num_workers}   Report ogni 60s")
-    print(f"Avvio: {datetime.datetime.now().strftime('%H:%M:%S')}")
+    total_files = sum(count_folder(_SCRIPT_DIR / f)[0] for f in folders if (_SCRIPT_DIR / f).exists())
+    total_mb = sum(count_folder(_SCRIPT_DIR / f)[1] for f in folders if (_SCRIPT_DIR / f).exists())
+
+    print(f"Upload: {', '.join(folders)} — {total_files:,} file, {total_mb/1024:.1f} GB")
+    print(f"Workers: {num_workers} | Avvio: {datetime.datetime.now().strftime('%H:%M:%S')}")
     print(f"(Se interrompi, rilancia lo stesso comando per riprendere)")
     print("=" * 60)
 
+    try:
+        from huggingface_hub.utils import disable_progress_bars
+        disable_progress_bars()
+    except Exception:
+        pass
+
     api.upload_large_folder(
         repo_id=repo_id,
-        folder_path=str(_SCRIPT_DIR),   # root del progetto
+        folder_path=str(_SCRIPT_DIR),
         repo_type='dataset',
         allow_patterns=patterns,
         num_workers=num_workers,
         print_report=True,
-        print_report_every=60,
+        print_report_every=300,
     )
 
 

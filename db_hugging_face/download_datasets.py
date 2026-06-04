@@ -1,20 +1,22 @@
 """
-download_datasets.py — Scarica dataset da HuggingFace in parallelo, senza rate limit.
+download_datasets.py — Scarica dataset da HuggingFace in parallelo, rispettando i rate limit.
 
 Strategia anti-rate-limit:
-  - list_repo_tree() UNA volta per dataset  → poche chiamate API paginate (~5-10)
-  - Download via URL CDN diretti             → non contano nel rate limit API
-  - Thread pool per file paralleli           → massima velocità di download
+  - list_repo_tree() UNA volta per dataset  → poche chiamate Hub API (~5-10 per dataset)
+  - Download via URL CDN diretti (/resolve/) → bucket Resolver, molto più generoso
+  - Rate limiter interno a 10 req/sec        → sotto il limite Free (16.7 req/sec)
+  - Thread pool con N worker paralleli       → default 4
 
-Il vecchio approccio (snapshot_download) faceva una richiesta HEAD per ogni file:
-5000 immagini = 5000 richieste API → rate limit 429 immediato.
+Rate limit HuggingFace (piano Free, finestre da 5 minuti):
+  - Hub API (list, commit, search): 1.000 req/5min  → ~3.3 req/sec
+  - Resolver (CDN /resolve/):       5.000 req/5min  → ~16.7 req/sec
 
 Uso:
     python download_datasets.py                    # config automatica per PC corrente
     python download_datasets.py --config FILE      # config esplicita
     python download_datasets.py --check            # solo verifica stato locale
     python download_datasets.py --force            # riscarica anche file già presenti
-    python download_datasets.py --workers N        # worker paralleli (default: 8)
+    python download_datasets.py --workers N        # worker paralleli (default: 4)
     python download_datasets.py --token hf_xxx     # token HuggingFace
 """
 import argparse
@@ -65,6 +67,26 @@ def _count_images(path: str) -> int:
     return _ci(path)
 
 
+class _RateLimiter:
+    """Limita le richieste a max `rps` al secondo (condiviso tra tutti i thread)."""
+    def __init__(self, rps: float):
+        self._interval = 1.0 / rps
+        self._lock = Lock()
+        self._last = 0.0
+
+    def acquire(self):
+        with self._lock:
+            now = time.monotonic()
+            wait = self._last + self._interval - now
+            if wait > 0:
+                time.sleep(wait)
+            self._last = time.monotonic()
+
+
+# Rate limiter globale: 10 req/sec → 3.000 req/5min (sotto il limite Free di 5.000)
+_RESOLVER_LIMITER = _RateLimiter(rps=10)
+
+
 def _list_remote_files(api, repo_id: str, path_in_repo: str, token: str) -> list:
     """
     Lista tutti i file (RepoFile) sotto path_in_repo nel repo HuggingFace.
@@ -86,17 +108,18 @@ def _list_remote_files(api, repo_id: str, path_in_repo: str, token: str) -> list
 
 def _download_file(session, url: str, local_path: Path, max_retries: int = 5) -> bool:
     """
-    Scarica un file via CDN diretto. Gestisce retry e rate limit.
-    Non conta nel rate limit API HuggingFace (è una richiesta CDN).
+    Scarica un file via CDN diretto. Rispetta il rate limiter globale (10 req/sec).
+    Usa il bucket Resolver di HF (5.000 req/5min per Free).
     """
     local_path.parent.mkdir(parents=True, exist_ok=True)
     tmp_path = local_path.with_suffix(local_path.suffix + '.tmp')
 
     for attempt in range(1, max_retries + 1):
         try:
+            _RESOLVER_LIMITER.acquire()
             with session.get(url, stream=True, timeout=120) as r:
                 if r.status_code == 429:
-                    wait = 30 * attempt
+                    wait = 60 * attempt
                     time.sleep(wait)
                     continue
                 r.raise_for_status()
@@ -195,7 +218,7 @@ def main():
     parser.add_argument('--config', type=str, help='Path config JSON (default: auto per PC)')
     parser.add_argument('--force', action='store_true', help='Riscarica anche file già presenti')
     parser.add_argument('--check', action='store_true', help='Solo verifica stato locale, non scarica')
-    parser.add_argument('--workers', type=int, default=8, help='Worker paralleli per file (default: 8)')
+    parser.add_argument('--workers', type=int, default=4, help='Worker paralleli per file (default: 4, Free plan: max ~10 req/sec)')
     parser.add_argument('--token', type=str, help='Token HuggingFace Read. Salvato in setup/.hf_token.')
     args = parser.parse_args()
 
