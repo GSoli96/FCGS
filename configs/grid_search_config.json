@@ -7,7 +7,7 @@
   "notification_interval": 100,
   "heartbeat_interval_hours": 4,
   "gpu_blacklist": [],
-  "num_parallel_executions": 3,
+  "num_parallel_executions": 1,
   "base_csv_path": "results/csv",
   "base_log_path": "results/log",
   "heavy_client_threshold": 8,

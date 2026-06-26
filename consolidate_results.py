@@ -1,16 +1,20 @@
 """
-consolidate_results.py — Consolida e deduplicazione i CSV di tutti i PC in all_results.csv.
+consolidate_results.py — Consolida e deduplica i CSV di tutti i PC in all_results.csv.
 
 Per ogni gruppo di configurazioni identiche (stesso dataset, modello, hyperparametri),
-mantiene solo la riga con il best_acc più alto.
+mantiene solo la riga con il best_acc più alto. Scarta automaticamente i risultati
+inattendibili (best_round <= 0 o total_duration < 60s) e la cartella result_DELL/csv_MSI
+(data leakage rilevato: 51% dei run a 100% accuracy).
 
 Uso:
-    python consolidate_results.py
-    python consolidate_results.py --dry-run   # solo report, non scrive
+    python consolidate_results.py              # aggrega e scrive all_results.csv
+    python consolidate_results.py --dry-run    # solo report, non scrive
+    python consolidate_results.py --cleanup    # dopo aver scritto, elimina le cartelle per-PC in results/
 """
 import csv
 import os
 import glob
+import shutil
 import argparse
 from pathlib import Path
 from typing import Dict, List, Tuple, FrozenSet
@@ -25,6 +29,12 @@ DEDUP_KEYS = [
 ]
 
 METRIC_KEY = 'best_acc'
+
+# Cartelle da escludere perché i risultati non sono attendibili.
+# result_DELL/csv_MSI: 51% dei run a 100% accuracy su tutti i modelli/dataset → data leakage.
+EXCLUDE_PATHS = [
+    'result_DELL/csv/csv_MSI',
+]
 
 
 def _row_key(row: Dict) -> FrozenSet[Tuple[str, str]]:
@@ -44,6 +54,19 @@ def _safe_float(v) -> float:
         return -1.0
 
 
+def _is_reliable(row: Dict) -> bool:
+    """Scarta righe dove il training non è effettivamente avvenuto."""
+    try:
+        best_round = int(float(row.get('best_round', -1) or -1))
+    except (ValueError, TypeError):
+        best_round = -1
+    try:
+        duration = float(row.get('total_duration', 0) or 0)
+    except (ValueError, TypeError):
+        duration = 0
+    return best_round > 0 and duration >= 60
+
+
 def load_csv(path: str) -> List[Dict]:
     rows = []
     try:
@@ -58,21 +81,28 @@ def load_csv(path: str) -> List[Dict]:
 
 def find_all_csvs() -> List[str]:
     found = []
-    # Nuova struttura: csv/csv_{PC}/
-    for p in glob.glob(str(_PROJECT_ROOT / 'csv' / 'csv_*' / 'federated_grid_search_results_*.csv')):
-        found.append(p)
-    # Legacy: csv_{PC}/{PC}/
-    for p in glob.glob(str(_PROJECT_ROOT / 'csv_*' / '*' / 'federated_grid_search_results_*.csv')):
+    normalized_excludes = [e.replace('/', os.sep) for e in EXCLUDE_PATHS]
+
+    # Tutti i federated_grid_search_results_*.csv in qualsiasi sottocartella di results/
+    for p in glob.glob(str(_PROJECT_ROOT / 'results' / '**' / 'federated_grid_search_results_*.csv'),
+                       recursive=True):
+        if not any(excl in p for excl in normalized_excludes):
+            found.append(p)
+
+    # Tutti gli all_results*.csv dentro results/ (aggregazioni intermedie per-PC)
+    for p in glob.glob(str(_PROJECT_ROOT / 'results' / '**' / 'all_results*.csv'), recursive=True):
         if p not in found:
             found.append(p)
-    # all_results.csv corrente
-    ar = str(_PROJECT_ROOT / 'all_results.csv')
-    if os.path.exists(ar) and ar not in found:
-        found.append(ar)
+
+    # all_results.csv nella root (storico consolidato precedente)
+    root_ar = str(_PROJECT_ROOT / 'all_results.csv')
+    if os.path.exists(root_ar) and root_ar not in found:
+        found.append(root_ar)
+
     return found
 
 
-def consolidate(dry_run: bool = False) -> None:
+def consolidate(dry_run: bool = False, cleanup: bool = False) -> None:
     csv_files = find_all_csvs()
     if not csv_files:
         print("Nessun CSV trovato.")
@@ -86,6 +116,12 @@ def consolidate(dry_run: bool = False) -> None:
         all_rows.extend(rows)
 
     print(f"\nTotale righe caricate: {len(all_rows)}")
+
+    # Filtro affidabilità
+    before_filter = len(all_rows)
+    all_rows = [r for r in all_rows if _is_reliable(r)]
+    print(f"Righe scartate (best_round<=0 o duration<60s): {before_filter - len(all_rows)}")
+    print(f"Righe dopo filtro affidabilità: {len(all_rows)}")
 
     # Deduplicazione: per ogni chiave, mantieni la riga con best_acc più alto
     best: Dict[FrozenSet, Dict] = {}
@@ -118,9 +154,37 @@ def consolidate(dry_run: bool = False) -> None:
 
     print(f"\nall_results.csv aggiornato: {len(unique_rows)} righe -> {out_path}")
 
+    if cleanup:
+        import stat
+
+        def _force_remove(func, path, exc_info):
+            try:
+                os.chmod(path, stat.S_IWRITE)
+                func(path)
+            except Exception:
+                pass
+
+        results_dir = _PROJECT_ROOT / 'results'
+        if results_dir.is_dir():
+            print(f"\nElimino le sottocartelle per-PC in {results_dir}...")
+            for item in results_dir.iterdir():
+                if item.is_dir():
+                    shutil.rmtree(item, onerror=_force_remove)
+                    print(f"  Eliminata: {item}")
+            print("Cleanup completato.")
+        else:
+            print("Cartella results/ non trovata, nulla da eliminare.")
+
 
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser(description='Consolida i CSV di tutti i PC in all_results.csv')
+    parser = argparse.ArgumentParser(
+        description='Consolida i CSV di tutti i PC in all_results.csv')
     parser.add_argument('--dry-run', action='store_true', help='Solo report, non scrive')
+    parser.add_argument('--cleanup', action='store_true',
+                        help='Elimina le cartelle per-PC in results/ dopo la consolidazione')
     args = parser.parse_args()
-    consolidate(dry_run=args.dry_run)
+
+    if args.cleanup and args.dry_run:
+        print("[WARN] --cleanup ignorato in modalità --dry-run.")
+
+    consolidate(dry_run=args.dry_run, cleanup=args.cleanup and not args.dry_run)

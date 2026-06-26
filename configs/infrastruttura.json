@@ -1,9 +1,0 @@
-{
-  "cluster_name": "Rete Tailscale Giand",
-  "nodes": [
-    { "name": "siando", "alias": "localhost", "role": "master" },
-    { "name": "msi", "alias": "msi", "user": "giand" },
-    { "name": "msidomino11", "alias": "domino11", "user": "domin" },
-    { "name": "msidomino12", "alias": "domino12", "user": "dastl" }
-  ]
-}

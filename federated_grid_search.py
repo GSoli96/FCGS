@@ -13,30 +13,25 @@ import re
 import logging
 import requests
 from requests.exceptions import ConnectionError
-import socketio
 import argparse
 from pathlib import Path
 
-import PCNAME
 import csv
 import os
-from typing import Dict, List, Any, Generator, Set, FrozenSet, Tuple
+from typing import Dict, List, Any, Generator, Set, FrozenSet, Tuple, Optional
 import multiprocessing
 
-from trusted_authority import TrustedAuthority
 import federated_server
 import run_multiple_clients
 
-NUM_PARALLEL_EXECUTIONS = 20
-# Configs con num_clients > questo valore vengono eseguiti in isolamento (heavy mode)
-HEAVY_CLIENT_THRESHOLD = 8
-
 _PROJECT_ROOT = Path(__file__).parent
 _CONFIGS_DIR = _PROJECT_ROOT / 'configs'
-_pc_specific_config = str(_CONFIGS_DIR / f'grid_search_config_{PCNAME.name}.json')
-GRID_SEARCH_CONFIG_PATH = _pc_specific_config if os.path.exists(_pc_specific_config) else str(_CONFIGS_DIR / 'grid_search_config.json')
-VERBOSE_DUPLICATE_CHECK = False
+GRID_SEARCH_CONFIG_PATH = str(_CONFIGS_DIR / 'grid_search_config.json')
 
+
+# ---------------------------------------------------------------------------
+# Utility
+# ---------------------------------------------------------------------------
 
 def _format_duration(seconds: float) -> str:
     h = int(seconds // 3600)
@@ -50,14 +45,12 @@ def _format_duration(seconds: float) -> str:
 
 
 def _safe_print(text: str) -> None:
-    """Print handling UnicodeEncodeError on Windows (e.g. emoji in cp1252 stdout)."""
     try:
         print(text)
     except UnicodeEncodeError:
-        import sys as _sys
         try:
-            _sys.stdout.buffer.write((text + '\n').encode('utf-8'))
-            _sys.stdout.buffer.flush()
+            sys.stdout.buffer.write((text + '\n').encode('utf-8'))
+            sys.stdout.buffer.flush()
         except Exception:
             print(text.encode('ascii', errors='replace').decode('ascii'))
 
@@ -82,12 +75,12 @@ def send_telegram(token: str, chat_id: str, message: str, logger=None) -> None:
             _safe_print(err)
 
 
-def _setup_main_logger(pc_name: str, base_log_path: str) -> logging.Logger:
-    logger = logging.getLogger(f"FCGS-Main-{pc_name}")
+def _setup_main_logger(base_log_path: str) -> logging.Logger:
+    logger = logging.getLogger("FCGS-Main")
     logger.setLevel(logging.INFO)
     if logger.hasHandlers():
         logger.handlers.clear()
-    log_dir = os.path.join(_PROJECT_ROOT, base_log_path, f'log_{pc_name}')
+    log_dir = os.path.join(str(_PROJECT_ROOT), base_log_path)
     os.makedirs(log_dir, exist_ok=True)
     fh = logging.FileHandler(os.path.join(log_dir, 'main.log'), mode='w', encoding='utf-8')
     fh.setLevel(logging.INFO)
@@ -100,12 +93,14 @@ def _setup_main_logger(pc_name: str, base_log_path: str) -> logging.Logger:
     logger.addHandler(ch)
     return logger
 
+
 def get_config_fingerprint(config: Dict, keys: Set[str]) -> FrozenSet[Tuple[str, str]]:
-    fingerprint_items = []
+    items = []
     for key in sorted(list(keys)):
         if key in config and config[key] is not None and config[key] != '':
-            fingerprint_items.append((key, str(config[key])))
-    return frozenset(fingerprint_items)
+            items.append((key, str(config[key])))
+    return frozenset(items)
+
 
 def _safe_rmtree(path: str) -> None:
     def _onerror(func, fpath, exc_info):
@@ -123,7 +118,6 @@ def _safe_rmtree(path: str) -> None:
 
 
 def _get_pid_on_port(port: int) -> int:
-    """Returns PID listening on the given TCP port, or 0 if not found. Cross-platform."""
     if sys.platform == 'win32':
         try:
             result = subprocess.run(['netstat', '-ano'], capture_output=True, text=True, timeout=10)
@@ -140,13 +134,9 @@ def _get_pid_on_port(port: int) -> int:
         except Exception:
             pass
     else:
-        # Linux/macOS: prova ss prima, poi lsof come fallback
         try:
-            import re
             result = subprocess.run(
-                ['ss', '-tlnp', f'sport = :{port}'],
-                capture_output=True, text=True, timeout=10
-            )
+                ['ss', '-tlnp', f'sport = :{port}'], capture_output=True, text=True, timeout=10)
             for line in result.stdout.splitlines():
                 if f':{port}' in line:
                     m = re.search(r'pid=(\d+)', line)
@@ -156,9 +146,7 @@ def _get_pid_on_port(port: int) -> int:
             pass
         try:
             result = subprocess.run(
-                ['lsof', '-ti', f':{port}'],
-                capture_output=True, text=True, timeout=10
-            )
+                ['lsof', '-ti', f':{port}'], capture_output=True, text=True, timeout=10)
             first = result.stdout.strip().split('\n')[0]
             if first.isdigit():
                 return int(first)
@@ -168,18 +156,15 @@ def _get_pid_on_port(port: int) -> int:
 
 
 def _is_python_process(pid: int) -> bool:
-    """Returns True if the given PID is a Python interpreter process. Cross-platform."""
     if sys.platform == 'win32':
         try:
             result = subprocess.run(
                 ['tasklist', '/FI', f'PID eq {pid}', '/FO', 'CSV', '/NH'],
-                capture_output=True, text=True, timeout=10
-            )
+                capture_output=True, text=True, timeout=10)
             return 'python' in result.stdout.lower()
         except Exception:
             return False
     else:
-        # Linux: leggi /proc/<pid>/cmdline
         try:
             with open(f'/proc/{pid}/cmdline', 'rb') as f:
                 cmdline = f.read().decode('utf-8', errors='replace').replace('\x00', ' ')
@@ -188,16 +173,13 @@ def _is_python_process(pid: int) -> bool:
             pass
         try:
             result = subprocess.run(
-                ['ps', '-p', str(pid), '-o', 'comm='],
-                capture_output=True, text=True, timeout=10
-            )
+                ['ps', '-p', str(pid), '-o', 'comm='], capture_output=True, text=True, timeout=10)
             return 'python' in result.stdout.lower()
         except Exception:
             return False
 
 
 def _kill_process(pid: int) -> None:
-    """Force-kills a process by PID. Cross-platform."""
     if sys.platform == 'win32':
         subprocess.run(['taskkill', '/F', '/PID', str(pid)], capture_output=True, timeout=10)
     else:
@@ -205,8 +187,6 @@ def _kill_process(pid: int) -> None:
 
 
 def _port_is_listening(host: str, port: int, timeout: float = 0.3) -> bool:
-    """Returns True only if a connection is actively accepted.
-    Any connection failure (refused, timeout, error) is treated as 'free'."""
     try:
         with _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM) as s:
             s.settimeout(timeout)
@@ -217,19 +197,15 @@ def _port_is_listening(host: str, port: int, timeout: float = 0.3) -> bool:
 
 
 def find_free_port(host: str, preferred_port: int, max_scan: int = 200) -> int:
-    """Returns the first TCP port (starting from preferred_port) that nothing is actively listening on."""
     for candidate in range(preferred_port, preferred_port + max_scan):
         if not _port_is_listening(host, candidate):
             return candidate
-    # Last resort: let the OS pick a free port
     with _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM) as s:
         s.bind((host, 0))
         return s.getsockname()[1]
 
 
 def wait_for_port_free(host: str, port: int, timeout: int = 120) -> bool:
-    """Waits until no process is actively listening on the port (netstat-based check), or timeout expires.
-    After 30s, attempts to kill the Python process holding the port."""
     deadline = time.time() + timeout
     kill_after = time.time() + 30
     kill_attempted = False
@@ -243,7 +219,6 @@ def wait_for_port_free(host: str, port: int, timeout: int = 120) -> bool:
                 print(f"  [PortFree] Port {port} held by Python PID {pid}. Force-terminating...")
                 try:
                     _kill_process(pid)
-                    print(f"  [PortFree] PID {pid} killed. Waiting for port to release...")
                     time.sleep(5)
                     continue
                 except Exception as e:
@@ -253,75 +228,65 @@ def wait_for_port_free(host: str, port: int, timeout: int = 120) -> bool:
 
 
 def pre_download_model_weights(model_names: set) -> None:
-    """
-    Downloads all pretrained weights to the local torchvision disk cache before workers start.
-    Worker processes (spawned fresh) then load from cache instantly — no download delay.
-    """
     try:
         import torchvision.models as tv_models
     except ImportError:
-        print("[PreDownload] torchvision not available, skipping pre-download.")
+        print("[PreDownload] torchvision not available, skipping.")
         return
-
     weight_map = {
         'GoogLeNet': (tv_models.googlenet, tv_models.GoogLeNet_Weights.IMAGENET1K_V1),
-        'AlexNet':   (tv_models.alexnet,    tv_models.AlexNet_Weights.IMAGENET1K_V1),
-        'ResNet18':  (tv_models.resnet18,   tv_models.ResNet18_Weights.IMAGENET1K_V1),
-        'ResNet34':  (tv_models.resnet34,   tv_models.ResNet34_Weights.IMAGENET1K_V1),
-        'ResNet50':  (tv_models.resnet50,   tv_models.ResNet50_Weights.IMAGENET1K_V1),
-        'ResNet101': (tv_models.resnet101,  tv_models.ResNet101_Weights.IMAGENET1K_V1),
+        'AlexNet':   (tv_models.alexnet,   tv_models.AlexNet_Weights.IMAGENET1K_V1),
+        'ResNet18':  (tv_models.resnet18,  tv_models.ResNet18_Weights.IMAGENET1K_V1),
+        'ResNet34':  (tv_models.resnet34,  tv_models.ResNet34_Weights.IMAGENET1K_V1),
+        'ResNet50':  (tv_models.resnet50,  tv_models.ResNet50_Weights.IMAGENET1K_V1),
+        'ResNet101': (tv_models.resnet101, tv_models.ResNet101_Weights.IMAGENET1K_V1),
     }
-
-    print("\n=== Pre-downloading model weights (CPU cache check) ===")
+    print("\n=== Pre-downloading model weights ===")
     for name in sorted(model_names):
         if name not in weight_map:
-            print(f"[PreDownload] {name}: no pretrained weights needed (skipping).")
+            print(f"[PreDownload] {name}: no pretrained weights (skipping).")
             continue
         fn, weights_enum = weight_map[name]
         print(f"[PreDownload] Checking {name}...", flush=True)
         try:
-            model = fn(weights=weights_enum)
-            del model
-            print(f"[PreDownload] {name} weights ready.")
+            _m = fn(weights=weights_enum)
+            del _m
+            print(f"[PreDownload] {name} ready.")
         except Exception as e:
-            print(f"[PreDownload] WARNING — could not pre-load {name}: {e}")
+            print(f"[PreDownload] WARNING: could not pre-load {name}: {e}")
     print("=== Pre-download complete ===\n")
 
 
-def wait_for_server_ready(url, timeout=60):
-    start_time = time.time()
-    while time.time() - start_time < timeout:
+def wait_for_server_ready(url: str, timeout: int = 60) -> bool:
+    start = time.time()
+    while time.time() - start < timeout:
         try:
-            response = requests.get(url)
-            if response.status_code == 200: return True
+            if requests.get(url).status_code == 200:
+                return True
         except ConnectionError:
             time.sleep(1)
     return False
 
 
 def load_json(filename: str) -> Dict:
-    with open(filename) as f: return json.load(f)
+    with open(filename) as f:
+        return json.load(f)
 
 
-def append_results_to_csv(csv_path: str, run_summary: Dict, lock: multiprocessing.Lock):
-    lock.acquire()
-    try:
-        all_keys = set(run_summary.keys())
-        if os.path.exists(csv_path) and os.path.getsize(csv_path) > 0:
-            with open(csv_path, 'r', newline='', encoding='utf-8') as f:
-                reader = csv.reader(f)
-                header = next(reader)
-                all_keys.update(header)
-
-        file_is_empty = not os.path.exists(csv_path) or os.path.getsize(csv_path) == 0
-        with open(csv_path, mode='a', newline='', encoding='utf-8') as f:
-            fieldnames = sorted(list(all_keys))
-            writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction='ignore')
-            if file_is_empty:
-                writer.writeheader()
-            writer.writerow(run_summary)
-    finally:
-        lock.release()
+def append_results_to_csv(csv_path: str, run_summary: Dict) -> None:
+    all_keys = set(run_summary.keys())
+    if os.path.exists(csv_path) and os.path.getsize(csv_path) > 0:
+        with open(csv_path, 'r', newline='', encoding='utf-8') as f:
+            reader = csv.reader(f)
+            header = next(reader, [])
+            all_keys.update(header)
+    file_is_empty = not os.path.exists(csv_path) or os.path.getsize(csv_path) == 0
+    with open(csv_path, mode='a', newline='', encoding='utf-8') as f:
+        fieldnames = sorted(list(all_keys))
+        writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction='ignore')
+        if file_is_empty:
+            writer.writeheader()
+        writer.writerow(run_summary)
 
 
 _MODEL_COST = {
@@ -334,16 +299,10 @@ _MODEL_COST = {
     'ResNet101': 6.0,
 }
 
-def _adaptive_startup_timeout(config: dict, base: int = 600) -> int:
-    """Compute a per-experiment server_startup_timeout based on workload complexity.
 
-    Larger datasets and heavier models require more time for clients to initialize
-    their data loaders and load model weights before sending the 'client_ready' event.
-    Homomorphic encryption (CKKS) adds significant extra setup time per client.
-    """
+def _adaptive_startup_timeout(config: dict, base: int = 600) -> int:
     t = base
     images = config.get('num_images', 1000)
-    # +30s for every extra 500 images above 1000
     t += max(0, int((images - 1000) / 500) * 30)
     model_extra = {
         'AlexNet': 60, 'GoogLeNet': 120,
@@ -351,43 +310,24 @@ def _adaptive_startup_timeout(config: dict, base: int = 600) -> int:
     }
     t += model_extra.get(config.get('model_name', ''), 0)
     if config.get('encryption_mode') == 'homomorphic':
-        t += 300  # CKKS context generation + encrypted tensor init
+        t += 300
     return min(t, 3600)
 
 
 def compute_complexity_score(cfg: Dict) -> float:
-    """
-    Stima il costo computazionale di una configurazione FL.
-    Usato per ordinare le task dalla più semplice alla più complessa.
-
-    Fattori considerati:
-      - num_clients × global_epoch × local_epoch  (tempo lineare)
-      - image_size²                               (costo quadratico per immagine)
-      - num_images                                (dimensione dataset, normalizzata su 5000)
-      - peso del modello                          (parametri e forward pass)
-      - cifratura omomorfica                      (×10 rispetto a no_encryption)
-      - num_custom_layers                         (layer extra FC)
-    """
     score = (cfg.get('num_clients', 2)
              * cfg.get('global_epoch', 5)
              * cfg.get('local_epoch', 2))
-
     image_size = cfg.get('image_size', 128)
     score *= (image_size / 128.0) ** 2
-
     num_images = cfg.get('num_images', 5000)
     score *= (num_images / 5000.0)
-
-    model = cfg.get('model_name', 'ConvNet')
-    score *= _MODEL_COST.get(model, 2.0)
-
+    score *= _MODEL_COST.get(cfg.get('model_name', 'ConvNet'), 2.0)
     if cfg.get('encryption_mode') == 'homomorphic':
         score *= 10.0
-
     layers = cfg.get('num_custom_layers', 2)
     if layers and layers > 0:
         score *= (layers / 2.0)
-
     return score
 
 
@@ -402,10 +342,11 @@ def generate_configurations(base_config: Dict, search_space: Dict) -> Generator[
         yield config
 
 
+# ---------------------------------------------------------------------------
+# Server / TA subprocess targets
+# ---------------------------------------------------------------------------
+
 def _server_process_target(config: Dict, result_queue: multiprocessing.Queue) -> None:
-    """Gira il FederatedServer in un subprocess separato e mette run_summary nella queue."""
-    # Prepare crash log path before FederatedServer init so early crashes are visible
-    # (server log file stays 0 bytes on Windows if the process dies before the first flush).
     _log_dir_base = config.get('log_dir', 'logs')
     _crash_log = os.path.join(_log_dir_base, time.strftime('%d%m'),
                               'FL-Server-LOG', f'{time.strftime("%m%d%H%M")}_crash.log')
@@ -414,49 +355,27 @@ def _server_process_target(config: Dict, result_queue: multiprocessing.Queue) ->
         try:
             server.run()
         except SystemExit:
-            # _shutdown_server usa ctypes per sollevare SystemExit nel thread main
-            # del subprocess. Lo catturiamo per poter ancora salvare i risultati.
             pass
-        # Safety net: if _shutdown_server's emergency save didn't run (e.g. killed before
-        # it could complete), save partial results here before returning to the worker.
         if server.aggregator.run_summary is None and server.aggregator.metrics_history:
             try:
                 server.aggregator.save_results()
             except Exception:
                 pass
-        run_summary = server.aggregator.get_run_summary()
-        result_queue.put(run_summary)
+        result_queue.put(server.aggregator.get_run_summary())
     except Exception as e:
         tb = traceback.format_exc()
-        print(f"[ServerProc W{config.get('worker_id','?')}] Error: {e}\n{tb}")
+        print(f"[ServerProc] Error: {e}\n{tb}")
         try:
             os.makedirs(os.path.dirname(_crash_log), exist_ok=True)
-            with open(_crash_log, 'w', encoding='utf-8') as _cf:
-                _cf.write(f"SERVER CRASH — {time.strftime('%Y-%m-%d %H:%M:%S')}\n"
-                          f"Dataset: {config.get('dataset_name')} | Model: {config.get('model_name')}\n"
-                          f"Worker: {config.get('worker_id')}\n\n{tb}")
+            with open(_crash_log, 'w', encoding='utf-8') as cf:
+                cf.write(f"SERVER CRASH — {time.strftime('%Y-%m-%d %H:%M:%S')}\n"
+                         f"Dataset: {config.get('dataset_name')} | Model: {config.get('model_name')}\n\n{tb}")
         except Exception:
             pass
         result_queue.put(None)
 
 
-def start_ta_thread(config: Dict, ta_instance_ref: List) -> None:
-    worker_id = config.get('worker_id', 'N/A')
-    try:
-        ta = TrustedAuthority(
-            host=config['ip_address'],
-            port=config['ta_port'],
-            he_backend=config.get('he_backend', 'paillier')
-        )
-        ta_instance_ref.append(ta)
-        ta.run()
-    except Exception as e:
-        print(f"[W{worker_id}] TA CRASH: {e}\n{traceback.format_exc()}")
-
-
 def _ta_process_target(config: Dict) -> None:
-    """Runs the Trusted Authority in a separate subprocess."""
-    worker_id = config.get('worker_id', 'N/A')
     try:
         from trusted_authority import TrustedAuthority
         ta = TrustedAuthority(
@@ -466,53 +385,11 @@ def _ta_process_target(config: Dict) -> None:
         )
         ta.run()
     except Exception as e:
-        import traceback
-        print(f"[TAProc W{worker_id}] Error: {e}\n{traceback.format_exc()}")
+        print(f"[TAProc] Error: {e}\n{traceback.format_exc()}")
 
 
-def _heartbeat_loop(
-        telegram_token: str,
-        telegram_chat_id: str,
-        completed_count: multiprocessing.Value,
-        total_configs: int,
-        start_time: float,
-        pc_name: str,
-        interval_seconds: int,
-        stop_event: threading.Event,
-        error_count: multiprocessing.Value = None,
-        fail_count: multiprocessing.Value = None,
-        logger=None,
-) -> None:
-    while not stop_event.wait(interval_seconds):
-        done = completed_count.value
-        elapsed = time.time() - start_time
-        remaining = total_configs - done
-        pct = done / total_configs * 100 if total_configs > 0 else 0
-        eta_str = _format_duration((elapsed / done) * remaining) if done > 0 else "N/A"
-        errors = error_count.value if error_count is not None else 0
-        fails = fail_count.value if fail_count is not None else 0
-        send_telegram(telegram_token, telegram_chat_id,
-                      f"<b>FCGS Heartbeat — {pc_name}</b>\n"
-                      f"Completate: <b>{done}/{total_configs}</b> ({pct:.1f}%)\n"
-                      f"Rimanenti: {remaining}\n"
-                      f"Errori worker: {errors} | Fail (no risultati): {fails}\n"
-                      f"Tempo trascorso: {_format_duration(elapsed)}\n"
-                      f"ETA: {eta_str}",
-                      logger=logger)
-
-
-def _cleanup_after_task(
-        server_process: multiprocessing.Process,
-        port: int,
-        host: str,
-        worker_id: int,
-        max_port_wait: int = 30
-) -> bool:
-    """
-    Post-task cleanup: kill zombie server process (+ children) and verify the port is freed.
-    Returns True if the port is confirmed free, False if it could not be freed.
-    """
-    # Kill server + children (psutil tracks child processes created by Flask/Werkzeug)
+def _cleanup_after_task(server_process: multiprocessing.Process, port: int,
+                         host: str, worker_id: int, max_port_wait: int = 30) -> bool:
     if server_process.is_alive():
         try:
             import psutil
@@ -527,17 +404,15 @@ def _cleanup_after_task(
         server_process.kill()
         server_process.join(timeout=10)
 
-    # Wait for port to be released
     deadline = time.time() + max_port_wait
     while time.time() < deadline:
         if not _port_is_listening(host, port):
             return True
         time.sleep(1)
 
-    # Force-kill whatever is still holding the port
     pid = _get_pid_on_port(port)
     if pid and pid != os.getpid():
-        print(f"[W{worker_id}] Port {port} still held by PID {pid} after task. Force-killing.")
+        print(f"[W{worker_id}] Port {port} still held by PID {pid}. Force-killing.")
         try:
             _kill_process(pid)
             time.sleep(3)
@@ -545,560 +420,304 @@ def _cleanup_after_task(
             print(f"[W{worker_id}] Could not kill PID {pid}: {e}")
 
     if _port_is_listening(host, port):
-        print(f"[W{worker_id}] WARNING: port {port} could not be freed after task cleanup.")
+        print(f"[W{worker_id}] WARNING: port {port} could not be freed.")
         return False
     return True
 
 
-def run_grid_search_worker(
-        worker_id: int,
-        task_queue: multiprocessing.JoinableQueue,
-        base_port: int,
-        csv_lock: multiprocessing.Lock,
-        completed_count: multiprocessing.Value,
-        last_notified: multiprocessing.Value,
-        total_configs: int,
-        start_time: float,
-        notify_lock: multiprocessing.Lock,
-        notification_interval: int,
-        telegram_token: str,
-        telegram_chat_id: str,
-        gpu_blacklist: list = None,
-        error_count: multiprocessing.Value = None,
-        fail_count: multiprocessing.Value = None,
-        heavy_lock: multiprocessing.Lock = None,
-        heavy_running: multiprocessing.Value = None,
-        active_normal_workers: multiprocessing.Value = None,
-        heavy_threshold: int = HEAVY_CLIENT_THRESHOLD,
-) -> None:
-    print(f"--- Starting Grid Search Worker {worker_id} ---")
-    pc_name = PCNAME.name
-    logger = logging.getLogger(f"FCGS-Worker-{worker_id}-{pc_name}")
+# ---------------------------------------------------------------------------
+# Pool worker initializer — assegna GPU in base al PID
+# ---------------------------------------------------------------------------
 
-    # Distribuisce i worker sui GPU disponibili (escludendo gpu_blacklist).
-    # Ogni worker process ha il proprio spazio di ambiente, quindi impostare
-    # CUDA_VISIBLE_DEVICES qui non interferisce con gli altri worker.
+def _worker_init(gpu_blacklist: list) -> None:
     try:
-        import torch as _torch
-        if _torch.cuda.is_available():
-            _blacklist = gpu_blacklist or []
-            _n = _torch.cuda.device_count()
-            _usable = [i for i in range(_n) if i not in _blacklist]
-            if _usable:
-                _gpu = _usable[worker_id % len(_usable)]
-                os.environ['CUDA_VISIBLE_DEVICES'] = str(_gpu)
-                print(f"[W{worker_id}] Assigned to GPU {_gpu} "
-                      f"(usable: {_usable}, total: {_n})")
+        import torch as _t
+        if _t.cuda.is_available():
+            usable = [i for i in range(_t.cuda.device_count()) if i not in (gpu_blacklist or [])]
+            if usable:
+                gpu_idx = os.getpid() % len(usable)
+                os.environ['CUDA_VISIBLE_DEVICES'] = str(usable[gpu_idx])
+                print(f"[Worker PID {os.getpid()}] GPU {usable[gpu_idx]} assigned.")
     except Exception:
         pass
 
-    while True:
-        config = task_queue.get()
-        if config is None:
-            print(f"--- Worker {worker_id} shutting down. ---")
-            task_queue.task_done()
-            break
 
-        dataset_name = config.get('dataset_name', 'N/A')
-        model_name = config.get('model_name', 'N/A')
-        is_heavy = config.get('num_clients', 2) > heavy_threshold
-        print(f"[W{worker_id}] START {dataset_name} | {model_name} ({'heavy' if is_heavy else 'normal'})")
+# ---------------------------------------------------------------------------
+# Singolo esperimento FL — eseguito dai worker del Pool
+# ---------------------------------------------------------------------------
 
-        worker_splitting_dir = None
-        _heavy_acquired = False
-        _normal_counted = False
+def run_single_experiment(config: Dict) -> Optional[Dict]:
+    """Esegue un singolo esperimento FL. Chiamata come worker di multiprocessing.Pool."""
+    import gc
+
+    dataset_name = config.get('dataset_name', 'N/A')
+    model_name = config.get('model_name', 'N/A')
+
+    run_id = f"{dataset_name}__{model_name}__{os.getpid()}__{int(time.time() * 1000) % 100000}"
+    splitting_dir = os.path.join(str(_PROJECT_ROOT), config['base_split_data_path'], run_id)
+    log_dir       = os.path.join(str(_PROJECT_ROOT), config['base_log_path'], run_id)
+    plot_dir      = os.path.join(str(_PROJECT_ROOT), config['base_plot_path'], run_id)
+    metrics_dir   = os.path.join(str(_PROJECT_ROOT), config['base_csv_path'], 'runs')
+
+    os.makedirs(log_dir,     exist_ok=True)
+    os.makedirs(plot_dir,    exist_ok=True)
+    os.makedirs(metrics_dir, exist_ok=True)
+
+    config = {**config,
+              'splitting_dir':          splitting_dir,
+              'log_dir':                log_dir,
+              'plot_dir':               plot_dir,
+              'run_metrics_output_path': metrics_dir,
+              'worker_id':              os.getpid() % 100}
+
+    try:
+        print(f"[{dataset_name}|{model_name}] START")
+
+        # Port selection
+        for _retry in range(5):
+            config['port'] = find_free_port(config['ip_address'], config['port'])
+            time.sleep(0.1 * (_retry + 1))
+            if not _port_is_listening(config['ip_address'], config['port']):
+                break
+
+        if not wait_for_port_free(config['ip_address'], config['port'], timeout=180):
+            print(f"[{dataset_name}|{model_name}] Port {config['port']} busy after 180s. Skipping.")
+            return None
+
+        # Dataset check
+        _dataset_abs = os.path.join(str(_PROJECT_ROOT), config['dataset_path'])
+        from dataset_manager import _dataset_exists as _has_images
+        if not os.path.isdir(_dataset_abs) or not _has_images(_dataset_abs):
+            print(f"[{dataset_name}|{model_name}] Dataset not found: {_dataset_abs}. Skipping.")
+            return None
+
+        # Dataset split
+        os.makedirs(splitting_dir, exist_ok=True)
+        from data_splitter import DatasetSplitter
+        actual_clients = DatasetSplitter(splitting_dir, _dataset_abs,
+                                         config['num_clients']).split_dataset()
+        if actual_clients == 0:
+            print(f"[{dataset_name}|{model_name}] No valid clients after split. Skipping.")
+            _safe_rmtree(splitting_dir)
+            return None
+        config['MIN_NUM_WORKERS'] = actual_clients
+
+        # Adaptive startup timeout
+        config['server_startup_timeout'] = _adaptive_startup_timeout(
+            config, config.get('server_startup_timeout', 600))
+
+        # Server subprocess
+        result_queue = multiprocessing.Queue()
+        server_process = multiprocessing.Process(
+            target=_server_process_target,
+            args=(config, result_queue),
+            daemon=True,
+        )
+        server_process.start()
+
+        server_url = f"http://{config['ip_address']}:{config['port']}"
+        if wait_for_server_ready(server_url, timeout=config.get('server_ready_timeout', 60)):
+            run_multiple_clients.main(config, already_split=True)
+        else:
+            print(f"[{dataset_name}|{model_name}] Server not ready in time.")
+
+        server_process.join(timeout=config.get('server_join_timeout', 120))
+        _cleanup_after_task(server_process, config['port'], config['ip_address'], os.getpid())
+
+        # GPU + memory cleanup
         try:
-            # --- Heavy/Normal scheduling ---
-            if is_heavy and heavy_lock is not None:
-                print(f"[W{worker_id}] Heavy config ({config['num_clients']} clients > {heavy_threshold}): attendendo heavy_lock...")
-                heavy_lock.acquire()
-                _heavy_acquired = True
-                if heavy_running is not None:
-                    with heavy_running.get_lock():
-                        heavy_running.value = 1
-                # Aspetta che tutti i worker normali finiscano il task corrente
-                deadline = time.time() + 3600
-                while active_normal_workers is not None and time.time() < deadline:
-                    with active_normal_workers.get_lock():
-                        if active_normal_workers.value == 0:
-                            break
-                    time.sleep(2)
-                print(f"[W{worker_id}] Heavy config: via libera, avvio esecuzione.")
-            elif not is_heavy and heavy_running is not None:
-                # Worker normale: aspetta se c'è un heavy in corso
-                while True:
-                    with heavy_running.get_lock():
-                        if heavy_running.value == 0:
-                            break
-                    time.sleep(2)
-                if active_normal_workers is not None:
-                    with active_normal_workers.get_lock():
-                        active_normal_workers.value += 1
-                    _normal_counted = True
-
-            run_identifier = f"{dataset_name}_run_{worker_id}_{model_name}"
-            worker_splitting_dir = os.path.join(_PROJECT_ROOT, config['base_split_data_path'], f'split_{pc_name}', run_identifier)
-            worker_log_dir = os.path.join(_PROJECT_ROOT, config['base_log_path'], f'log_{pc_name}', run_identifier)
-            worker_plot_dir = os.path.join(_PROJECT_ROOT, config['base_plot_path'], f'plots_{pc_name}', run_identifier)
-            worker_metrics_dir = os.path.join(_PROJECT_ROOT, config['base_csv_path'], f'csv_{pc_name}', "runs")
-            # worker_splitting_dir viene creato DOPO i port check per non lasciare
-            # directory orfane quando la porta è occupata e il worker fa continue
-            os.makedirs(worker_log_dir, exist_ok=True)
-            os.makedirs(worker_plot_dir, exist_ok=True)
-            os.makedirs(worker_metrics_dir, exist_ok=True)
-
-            config['worker_id'] = worker_id
-            preferred_port = base_port + worker_id * 2
-            # Port selection with retry to mitigate TOCTOU race condition:
-            # another worker could grab the port between find_free_port() and the server bind.
-            for _port_retry in range(5):
-                config['port'] = find_free_port(config['ip_address'], preferred_port)
-                time.sleep(0.1 * (_port_retry + 1))
-                if not _port_is_listening(config['ip_address'], config['port']):
-                    break
-            if config['port'] != preferred_port:
-                print(f"[W{worker_id}] Port {preferred_port} busy, using {config['port']} instead.")
-            config['splitting_dir'] = worker_splitting_dir
-            config['log_dir'] = worker_log_dir
-            config['plot_dir'] = worker_plot_dir
-            config['run_metrics_output_path'] = worker_metrics_dir
-
-            if not wait_for_port_free(config['ip_address'], config['port'], timeout=180):
-                msg = f"[W{worker_id}] Port {config['port']} still occupied after 180s. Skipping {dataset_name}|{model_name}."
-                print(msg)
-                if telegram_token and telegram_chat_id:
-                    send_telegram(telegram_token, telegram_chat_id,
-                                  f"<b>⚠️ FCGS Port busy — Worker {worker_id} ({pc_name})</b>\n"
-                                  f"Config: {dataset_name} | {model_name}\n"
-                                  f"Porta {config['port']} occupata dopo 180s. Skipping.")
-                continue
-
-            # Porta libera: ora è sicuro creare la directory di split
-            os.makedirs(worker_splitting_dir, exist_ok=True)
-
-            # Esegui lo split REALE prima di avviare il server — così MIN_NUM_WORKERS
-            # riflette i client effettivi dopo I/O (non una stima dry-run che ignora
-            # fallimenti di copia su Windows sotto carico).
-            _dataset_abs = os.path.join(str(_PROJECT_ROOT), config['dataset_path'])
-            from dataset_manager import _dataset_exists as _has_images
-            if not os.path.isdir(_dataset_abs) or not _has_images(_dataset_abs):
-                logger.warning(f"[W{worker_id}] Dataset assente o vuoto: {_dataset_abs}. "
-                               f"Skipping {dataset_name}|{model_name}.")
-                _safe_rmtree(worker_splitting_dir)
-                continue
-            from data_splitter import DatasetSplitter
-            _splitter = DatasetSplitter(
-                output_base_dir=worker_splitting_dir,
-                source_images_dir=_dataset_abs,
-                num_clients=config['num_clients'],
-            )
-            actual_clients = _splitter.split_dataset()
-            if actual_clients == 0:
-                logger.warning(f"[W{worker_id}] split_dataset=0 client per "
-                               f"{dataset_name}|{model_name}. Skipping.")
-                _safe_rmtree(worker_splitting_dir)
-                continue
-            if actual_clients < config['num_clients']:
-                logger.info(f"[W{worker_id}] Split I/O: {actual_clients}/"
-                            f"{config['num_clients']} client validi dopo copia file.")
-            config["MIN_NUM_WORKERS"] = actual_clients
-
-            # Il server gira in un subprocess separato così, se si blocca,
-            # possiamo killarlo con SIGKILL e liberare la porta immediatamente.
-            # Calcola il timeout di avvio adattivo in base alla complessità dell'esperimento.
-            adaptive_startup_timeout = _adaptive_startup_timeout(
-                config, config.get('server_startup_timeout', 600))
-            config['server_startup_timeout'] = adaptive_startup_timeout
-
-            result_queue = multiprocessing.Queue()
-            server_process = multiprocessing.Process(
-                target=_server_process_target,
-                args=(config, result_queue),
-                daemon=True
-            )
-            server_process.start()
-            server_url = f"http://{config['ip_address']}:{config['port']}"
-            server_ready_timeout = config.get('server_ready_timeout', 60)
-            server_join_timeout = config.get('server_join_timeout', 120)
-            client_instances = []
-            _server_started_ok = wait_for_server_ready(server_url, timeout=server_ready_timeout)
-            if _server_started_ok:
-                client_instances = run_multiple_clients.main(config, already_split=True)
-            else:
-                msg = f"[W{worker_id}] Server non avviato per {dataset_name}|{model_name} entro {server_ready_timeout}s."
-                print(msg)
-                if telegram_token and telegram_chat_id:
-                    send_telegram(telegram_token, telegram_chat_id,
-                                  f"<b>⚠️ FCGS Server timeout — Worker {worker_id} ({pc_name})</b>\n"
-                                  f"Config: {dataset_name} | {model_name}\n"
-                                  f"Il server non ha risposto entro {server_ready_timeout}s.")
-            server_process.join(timeout=server_join_timeout)
-            if server_process.is_alive():
-                msg = f"[W{worker_id}] Server process ancora vivo dopo {server_join_timeout}s per {dataset_name}|{model_name}. SIGKILL."
-                print(msg)
-                if telegram_token and telegram_chat_id:
-                    send_telegram(telegram_token, telegram_chat_id,
-                                  f"<b>⚠️ FCGS Server hung — Worker {worker_id} ({pc_name})</b>\n"
-                                  f"Config: {dataset_name} | {model_name}\n"
-                                  f"Server non terminato dopo {server_join_timeout}s. Forzato SIGKILL.")
-            # Kill zombie server process + children and verify port is freed
-            _cleanup_after_task(server_process, config['port'], config['ip_address'], worker_id)
-
-            # Verify all client socket connections are closed before the next run.
-            # run_multiple_clients already did join+force-disconnect with timeout;
-            # this is a final safety check with references we hold here.
-            still_connected = [c for c in client_instances if c.sio.connected]
-            if still_connected:
-                print(f"[W{worker_id}] {len(still_connected)} client socket(s) still connected after cleanup. "
-                      f"Force-disconnecting...")
-                for c in still_connected:
-                    try:
-                        c.sio.disconnect()
-                    except Exception as _e:
-                        print(f"[W{worker_id}] Error disconnecting client: {_e}")
-
-            # GPU + memory cleanup between runs: prevents VRAM accumulation across experiments
-            # which causes progressively slower client initialization and eventual startup timeouts.
-            try:
-                import torch as _torch
-                if _torch.cuda.is_available():
-                    _torch.cuda.empty_cache()
-                    print(f"[W{worker_id}] GPU cache cleared.")
-            except Exception:
-                pass
-            import gc as _gc
-            _gc.collect()
-
-            try:
-                run_summary = result_queue.get(timeout=5)
-            except Exception:
-                run_summary = None
-            if run_summary:
-                append_results_to_csv(config['shared_csv_path'], run_summary, csv_lock)
-            else:
-                if fail_count is not None:
-                    with fail_count.get_lock():
-                        fail_count.value += 1
-                # Distinguish failure causes for better diagnostics
-                _exitcode = server_process.exitcode
-                if not _server_started_ok:
-                    _fail_reason = f"server non avviato entro {server_ready_timeout}s (Flask/SocketIO non risponde)"
-                elif _exitcode not in (0, None):
-                    _fail_reason = f"server crashato (exitcode={_exitcode})"
-                else:
-                    _fail_reason = "training completato ma nessun risultato (possibile: loss NaN o metriche non calcolabili)"
-                msg = f"[W{worker_id}] run_summary None per {dataset_name}|{model_name}: {_fail_reason}."
-                print(msg)
-                if telegram_token and telegram_chat_id:
-                    send_telegram(telegram_token, telegram_chat_id,
-                                  f"<b>⚠️ FCGS run_summary None — Worker {worker_id} ({pc_name})</b>\n"
-                                  f"Config: {dataset_name} | {model_name}\n"
-                                  f"Motivo: {_fail_reason}")
-                # Extra backoff after a failure: gives the OS time to release GPU/disk resources
-                # before the next experiment starts, reducing cascading failures.
-                time.sleep(10)
-            if os.path.exists(worker_splitting_dir):
-                _safe_rmtree(worker_splitting_dir)
-                print(f"[W{worker_id}] Cleaned up split dir: {worker_splitting_dir}")
-            time.sleep(5)
-
-            should_notify = False
-            with notify_lock:
-                with completed_count.get_lock():
-                    completed_count.value += 1
-                    done = completed_count.value
-                    if done - last_notified.value >= notification_interval:
-                        last_notified.value = done
-                        should_notify = True
-
-            print(f"[W{worker_id}] DONE  {dataset_name} | {model_name} ({done}/{total_configs})")
-
-            if should_notify and telegram_token and telegram_chat_id:
-                elapsed = time.time() - start_time
-                remaining = total_configs - done
-                eta_str = _format_duration((elapsed / done) * remaining) if done > 0 else "N/A"
-                pct = done / total_configs * 100 if total_configs > 0 else 0
-                send_telegram(telegram_token, telegram_chat_id,
-                              f"<b>FCGS Progress — {pc_name}</b>\n"
-                              f"Completate: <b>{done}/{total_configs}</b> ({pct:.1f}%)\n"
-                              f"Rimanenti: {remaining}\n"
-                              f"Tempo trascorso: {_format_duration(elapsed)}\n"
-                              f"ETA: {eta_str}\n"
-                              f"Ultimo: {dataset_name} | {model_name}")
-                print(f"[Notifier] Progress Telegram inviato ({done}/{total_configs})")
-
-        except Exception as e:
-            if error_count is not None:
-                with error_count.get_lock():
-                    error_count.value += 1
-            tb_str = traceback.format_exc()
-            print(f"[W{worker_id}] EXCEPTION on {dataset_name}|{model_name}:\n{tb_str}")
-            if telegram_token and telegram_chat_id:
-                send_telegram(telegram_token, telegram_chat_id,
-                              f"<b>⚠️ FCGS ERRORE — Worker {worker_id} ({pc_name})</b>\n"
-                              f"Config: {dataset_name} | {model_name}\n"
-                              f"<code>{str(e)[:500]}</code>")
-            if worker_splitting_dir is not None and os.path.exists(worker_splitting_dir):
-                _safe_rmtree(worker_splitting_dir)
-        finally:
-            if _heavy_acquired and heavy_lock is not None:
-                if heavy_running is not None:
-                    with heavy_running.get_lock():
-                        heavy_running.value = 0
-                heavy_lock.release()
-            if _normal_counted and active_normal_workers is not None:
-                with active_normal_workers.get_lock():
-                    active_normal_workers.value = max(0, active_normal_workers.value - 1)
-            task_queue.task_done()
-
-
-def _compute_num_workers(config: dict) -> int:
-    if 'num_parallel_executions' in config:
-        return int(config['num_parallel_executions'])
-    try:
-        import torch
-        if torch.cuda.is_available():
-            blacklist = config.get('gpu_blacklist', [])
-            usable = [i for i in range(torch.cuda.device_count()) if i not in blacklist]
-            return max(NUM_PARALLEL_EXECUTIONS, len(usable) * 4)
-    except Exception:
-        pass
-    return NUM_PARALLEL_EXECUTIONS
-
-
-def main():
-    # Bootstrap log: scritto con plain-file prima che il logger Python sia configurato.
-    # Permette di diagnosticare crash precoci (es. Domino11) che avvengono prima della
-    # prima riga di main.log.
-    _pc = PCNAME.name
-    _boot_log_dir = os.path.join(_PROJECT_ROOT, 'results', 'log', f'log_{_pc}')
-    try:
-        os.makedirs(_boot_log_dir, exist_ok=True)
-        with open(os.path.join(_boot_log_dir, 'bootstrap.log'), 'a', encoding='utf-8') as _bf:
-            _bf.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} — main() avviato (PID {os.getpid()})\n")
-    except Exception:
-        pass
-
-    # Fix: stdout invalido con Start-Process -WindowStyle Hidden.
-    # Se flush() fallisce l'handle è rotto → reindirizziamo a devnull.
-    # L'output utile va già su main.log tramite il logger, quindi non perdiamo nulla.
-    try:
-        sys.stdout.flush()
-    except OSError:
-        sys.stdout = open(os.devnull, 'w')
-        sys.stderr = open(os.devnull, 'w')
-
-    try:
-        _main_body()
-    except Exception as _boot_exc:
-        try:
-            import traceback as _tb
-            with open(os.path.join(_boot_log_dir, 'bootstrap.log'), 'a', encoding='utf-8') as _bf:
-                _bf.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} — CRASH FATALE: {_boot_exc}\n"
-                          f"{_tb.format_exc()}\n")
+            import torch as _t
+            if _t.cuda.is_available():
+                _t.cuda.empty_cache()
         except Exception:
             pass
-        raise
+        gc.collect()
+
+        try:
+            run_summary = result_queue.get(timeout=5)
+        except Exception:
+            run_summary = None
+
+        if run_summary is None:
+            print(f"[{dataset_name}|{model_name}] No result (server crash or NaN loss).")
+            time.sleep(10)
+
+        return run_summary
+
+    except Exception as e:
+        print(f"[{dataset_name}|{model_name}] ERROR: {e}\n{traceback.format_exc()}")
+        return None
+    finally:
+        if os.path.exists(splitting_dir):
+            _safe_rmtree(splitting_dir)
 
 
-def _main_body():
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+def main():
     if not os.path.exists(GRID_SEARCH_CONFIG_PATH):
-        print(f"ERRORE: nessun file di configurazione trovato.")
-        print(f"        Cercato: {_pc_specific_config}, poi: grid_search_config.json")
-        print(f"        Crea il file oppure passalo come argomento: python federated_grid_search.py <config.json>")
+        print(f"ERRORE: config non trovata: {GRID_SEARCH_CONFIG_PATH}")
         sys.exit(1)
+
     print(f"=== Configurazione: {GRID_SEARCH_CONFIG_PATH} ===")
-    base_grid_config = load_json(GRID_SEARCH_CONFIG_PATH)
+    base_config = load_json(GRID_SEARCH_CONFIG_PATH)
 
-    csv_lock = multiprocessing.Lock()
-    task_queue = multiprocessing.JoinableQueue()
-    pc_name = PCNAME.name
+    pc_name = _socket.gethostname()
+    _pc_results_dir = f"results/results_{pc_name}"
+    base_config['base_csv_path']        = f"{_pc_results_dir}/csv"
+    base_config['base_log_path']        = f"{_pc_results_dir}/log"
+    base_config['base_plot_path']       = f"{_pc_results_dir}/plots"
+    base_config['base_split_data_path'] = f"{_pc_results_dir}/run_dataset"
+    base_config['pc_name']              = pc_name
 
-    # Nuova struttura: csv/csv_{PC}/ e log/log_{PC}/
-    _base_log = base_grid_config.get('base_log_path', 'log')
-    _base_csv = base_grid_config.get('base_csv_path', 'csv')
-    _base_plot = base_grid_config.get('base_plot_path', 'static/plots')
-    _base_split = base_grid_config.get('base_split_data_path', 'run_dataset')
+    _base_csv   = base_config['base_csv_path']
+    _base_log   = base_config['base_log_path']
+    _base_plot  = base_config['base_plot_path']
+    _base_split = base_config['base_split_data_path']
 
-    base_csv_path = os.path.join(_PROJECT_ROOT, _base_csv, f'csv_{pc_name}')
-    os.makedirs(base_csv_path, exist_ok=True)
-    os.makedirs(os.path.join(_PROJECT_ROOT, _base_log, f'log_{pc_name}'), exist_ok=True)
-    os.makedirs(os.path.join(_PROJECT_ROOT, _base_plot, f'plots_{pc_name}'), exist_ok=True)
-    os.makedirs(os.path.join(_PROJECT_ROOT, _base_split, f'split_{pc_name}'), exist_ok=True)
+    base_csv_path = os.path.join(str(_PROJECT_ROOT), _base_csv)
+    os.makedirs(base_csv_path,                                              exist_ok=True)
+    os.makedirs(os.path.join(str(_PROJECT_ROOT), _base_log),               exist_ok=True)
+    os.makedirs(os.path.join(str(_PROJECT_ROOT), _base_plot),              exist_ok=True)
+    os.makedirs(os.path.join(str(_PROJECT_ROOT), _base_split),             exist_ok=True)
 
-    # Logger principale creato subito — usato anche per il download dei dataset.
-    _main_logger = _setup_main_logger(pc_name, _base_log)
+    logger = _setup_main_logger(_base_log)
+    logger.info(f"PC: {pc_name}  →  results in: {_pc_results_dir}")
 
     shared_csv_path = os.path.join(base_csv_path, f'federated_grid_search_results_{pc_name}.csv')
+    base_config['shared_csv_path'] = shared_csv_path
 
-    executed_fingerprints: Set[FrozenSet[Tuple[str, str]]] = set()
-    common_search_space = base_grid_config['common_search_space']
-    model_specific_search_space = base_grid_config['model_specific_search_space']
+    # ── Fingerprint dedup ─────────────────────────────────────────────────
+    common_search_space        = base_config['common_search_space']
+    model_specific_search_space = base_config['model_specific_search_space']
 
     all_possible_search_keys = set(common_search_space.keys())
     for model_params in model_specific_search_space.values():
         all_possible_search_keys.update(model_params.keys())
     all_possible_search_keys.update(['dataset_name', 'model_name'])
 
-    # Carica fingerprint da TUTTI i CSV di risultati presenti (tutti i PC).
-    # Struttura nuova: csv/csv_{PC}/federated_grid_search_results_{PC}.csv
-    # Struttura legacy: csv_{PC}/{PC}/federated_grid_search_results_{PC}.csv
-    import glob as _glob
-    all_result_csvs = _glob.glob(
-        os.path.join(_PROJECT_ROOT, _base_csv, 'csv_*', 'federated_grid_search_results_*.csv')
-    )
-    # Fallback legacy: vecchia struttura prima del refactoring
-    for _lp in _glob.glob(os.path.join(_PROJECT_ROOT, f'{_base_csv}_*', '*', 'federated_grid_search_results_*.csv')):
-        if _lp not in all_result_csvs:
-            all_result_csvs.append(_lp)
-    # Include anche all_results.csv se presente (storico consolidato)
-    _all_results_path = os.path.join(_PROJECT_ROOT, 'all_results.csv')
-    if os.path.exists(_all_results_path) and _all_results_path not in all_result_csvs:
-        all_result_csvs.append(_all_results_path)
-    if shared_csv_path not in all_result_csvs and os.path.exists(shared_csv_path):
-        all_result_csvs.append(shared_csv_path)
-
+    executed_fingerprints: Set[FrozenSet[Tuple[str, str]]] = set()
+    dedup_sources = [
+        str(_PROJECT_ROOT / 'all_results.csv'),  # storico consolidato
+        shared_csv_path,                          # run corrente
+    ]
     total_loaded = 0
-    for csv_path in all_result_csvs:
+    for csv_path in dedup_sources:
         if not os.path.exists(csv_path) or os.path.getsize(csv_path) == 0:
             continue
         with open(csv_path, 'r', newline='', encoding='utf-8') as f:
             reader = csv.DictReader(f)
             for row in reader:
                 model_name_from_row = row.get('model_name') or ''
-                if row.get('aggregation_algorithm') != "FedProx": row['fedprox_mu'] = '0.0'
-                if row.get('encryption_mode') == 'no_encryption': row['he_backend'] = 'N/A'
-                if 'ResNet' in model_name_from_row or 'GoogLeNet' in model_name_from_row or 'AlexNet' in model_name_from_row:
+                if row.get('aggregation_algorithm') != 'FedProx':
+                    row['fedprox_mu'] = '0.0'
+                if row.get('encryption_mode') == 'no_encryption':
+                    row['he_backend'] = 'N/A'
+                if any(m in model_name_from_row for m in ('ResNet', 'GoogLeNet', 'AlexNet')):
                     row.setdefault('image_size', '224')
                     row.setdefault('convnet_hidden1', '-1')
                     row.setdefault('convnet_hidden2', '-1')
                 elif 'ConvNet' in model_name_from_row:
                     row.setdefault('num_custom_layers', '-1')
-                fingerprint = get_config_fingerprint(row, all_possible_search_keys)
-                executed_fingerprints.add(fingerprint)
+                executed_fingerprints.add(get_config_fingerprint(row, all_possible_search_keys))
         count = sum(1 for _ in open(csv_path, encoding='utf-8')) - 1
-        print(f"  Loaded {count} fingerprints from {csv_path}")
+        logger.info(f"Loaded {count} fingerprints from {csv_path}")
         total_loaded += count
-    print(f"Loaded {len(executed_fingerprints)} unique fingerprints from {len(all_result_csvs)} CSV(s) ({total_loaded} rows total).")
+    logger.info(f"Total unique fingerprints: {len(executed_fingerprints)} (from {total_loaded} rows)")
 
-    fixed_params = {k: v for k, v in base_grid_config.items() if
-                    k not in ['datasets', 'common_search_space', 'model_specific_search_space']}
+    # ── Config generation ─────────────────────────────────────────────────
+    fixed_params = {k: v for k, v in base_config.items()
+                    if k not in ('datasets', 'common_search_space', 'model_specific_search_space')}
     fixed_params['shared_csv_path'] = shared_csv_path
-    configs_to_run_count = 0
-    total_generated_configs = 0
 
-    # Raccoglie tutte le configurazioni nuove in una lista prima di metterle in coda,
-    # in modo da poterle ordinare per complessità crescente (le più veloci prima).
     pending_configs: List[Dict] = []
+    total_generated = 0
 
-    for dataset_info in base_grid_config['datasets']:
-        # Itera sui modelli *attualmente attivi* nel file di configurazione
+    for dataset_info in base_config['datasets']:
         for model_name, specific_params in model_specific_search_space.items():
-            model_base_config = fixed_params.copy()
-            model_base_config.update({'dataset_name': dataset_info['name'], 'dataset_path': dataset_info['path'],
-                                      'num_classes': dataset_info['num_classes'], 'model_name': model_name,
-                                      'num_images': dataset_info.get('num_images', 5000)})
+            model_base = fixed_params.copy()
+            model_base.update({
+                'dataset_name': dataset_info['name'],
+                'dataset_path': dataset_info['path'],
+                'num_classes':  dataset_info['num_classes'],
+                'model_name':   model_name,
+                'num_images':   dataset_info.get('num_images', 5000),
+            })
             current_search_space = {**common_search_space, **specific_params}
 
-            for hyper_config in generate_configurations(model_base_config, current_search_space):
-                total_generated_configs += 1
-                if VERBOSE_DUPLICATE_CHECK: print("-" * 50,
-                                                  f"\n[{total_generated_configs}] Generated Raw Config:\n{json.dumps(hyper_config, indent=2)}")
-
-                if hyper_config.get('aggregation_algorithm') != "FedProx": hyper_config['fedprox_mu'] = 0.0
-                if hyper_config.get('encryption_mode') == 'no_encryption': hyper_config['he_backend'] = 'N/A'
-                if 'ResNet' in model_name or 'GoogLeNet' in model_name or 'AlexNet' in model_name:
+            for hyper_config in generate_configurations(model_base, current_search_space):
+                total_generated += 1
+                if hyper_config.get('aggregation_algorithm') != 'FedProx':
+                    hyper_config['fedprox_mu'] = 0.0
+                if hyper_config.get('encryption_mode') == 'no_encryption':
+                    hyper_config['he_backend'] = 'N/A'
+                if any(m in model_name for m in ('ResNet', 'GoogLeNet', 'AlexNet')):
                     hyper_config['image_size'] = 224
                     hyper_config.setdefault('convnet_hidden1', -1)
                     hyper_config.setdefault('convnet_hidden2', -1)
                 elif 'ConvNet' in model_name:
                     hyper_config.setdefault('num_custom_layers', -1)
-                if VERBOSE_DUPLICATE_CHECK: print(f" -> Normalized Config:\n{json.dumps(hyper_config, indent=2)}")
 
                 fingerprint = get_config_fingerprint(hyper_config, all_possible_search_keys)
-
-                if VERBOSE_DUPLICATE_CHECK: print(f" -> Fingerprint: {fingerprint}")
-
                 if fingerprint in executed_fingerprints:
-                    if VERBOSE_DUPLICATE_CHECK: print(" -> STATUS: DUPLICATE - Skipping.")
                     continue
 
-                if VERBOSE_DUPLICATE_CHECK: print(" -> STATUS: NEW - Adding to queue.")
                 executed_fingerprints.add(fingerprint)
                 pending_configs.append(hyper_config)
-                configs_to_run_count += 1
 
-    # Ordina dalla configurazione più semplice alla più complessa.
     pending_configs.sort(key=compute_complexity_score)
-
-    # Scarica solo i dataset effettivamente usati dalle configurazioni da eseguire.
-    # Fatto qui (dopo aver costruito pending_configs) per non scaricare dataset
-    # che questo PC non utilizzerà mai.
-    if pending_configs:
-        required_paths = {c['dataset_path'] for c in pending_configs}
-        datasets_to_download = [ds for ds in base_grid_config.get('datasets', [])
-                                 if ds['path'] in required_paths]
-        download_config = {**base_grid_config, 'datasets': datasets_to_download}
-        from dataset_manager import check_and_download_datasets_parallel
-        import time as _time
-        download_ok = check_and_download_datasets_parallel(
-            download_config, max_parallel=2, logger=_main_logger)
-        if not download_ok:
-            _main_logger.warning("[FCGS] Download incompleto al primo tentativo. Riprovo tra 60s...")
-            _time.sleep(60)
-            download_ok = check_and_download_datasets_parallel(
-                download_config, max_parallel=2, logger=_main_logger)
-        if not download_ok:
-            # Identify which dataset paths are actually missing so we can skip only those configs.
-            from dataset_manager import _dataset_exists as _has_imgs
-            failed_paths = {ds['path'] for ds in datasets_to_download
-                            if not _has_imgs(os.path.join(str(_PROJECT_ROOT), ds['path']))}
-            _main_logger.warning(
-                f"[FCGS] Download incompleto per {len(failed_paths)} dataset: {failed_paths}. "
-                "Le config corrispondenti saranno saltate, le altre continuano.")
-            _tok = base_grid_config.get('telegram_bot_token', '')
-            _cid = base_grid_config.get('telegram_chat_id', '')
-            send_telegram(_tok, _cid,
-                          f"<b>⚠️ FCGS Download parziale — {pc_name}</b>\n"
-                          f"Dataset non disponibili ({len(failed_paths)}): {failed_paths}\n"
-                          "Le altre configurazioni continuano normalmente.",
-                          logger=_main_logger)
-            # Remove configs for unavailable datasets; update counts accordingly.
-            before = len(pending_configs)
-            pending_configs = [c for c in pending_configs if c['dataset_path'] not in failed_paths]
-            configs_to_run_count = len(pending_configs)
-            _main_logger.warning(
-                f"[FCGS] Rimosse {before - configs_to_run_count} config per dataset mancanti. "
-                f"Rimangono {configs_to_run_count} config da eseguire.")
-            if not pending_configs:
-                _main_logger.error("[FCGS] Nessuna configurazione rimasta dopo la rimozione dei dataset falliti.")
-                sys.exit(1)
-
-    for hyper_config in pending_configs:
-        task_queue.put(hyper_config)
 
     if pending_configs:
         scores = [compute_complexity_score(c) for c in pending_configs]
         print(f"Complexity score range: {scores[0]:.1f} (min) -> {scores[-1]:.1f} (max)")
 
     print("=" * 80)
-    print(f"Generated {total_generated_configs} total configurations.")
-    print(f"Skipped {total_generated_configs - configs_to_run_count} already executed or redundant configurations.")
-    print(f"Adding {configs_to_run_count} new unique configurations to the execution queue (sorted by complexity).")
+    print(f"Generated {total_generated} total configurations.")
+    print(f"Skipped   {total_generated - len(pending_configs)} already executed.")
+    print(f"Running   {len(pending_configs)} new configurations (sorted by complexity).")
     print("=" * 80)
 
-    if configs_to_run_count == 0:
-        print("=== No new configurations to run. Exiting. ===")
+    if not pending_configs:
+        print("=== No new configurations. Exiting. ===")
         return
 
-    # Kill any leftover FCGS processes from previous runs before writing the new PID.
-    # This prevents zombie workers that survive a partial stop from competing for GPU/CSV.
-    _pid_file = os.path.join(_PROJECT_ROOT, 'fcgs.pid')
-    if os.path.exists(_pid_file):
+    # ── Dataset download ──────────────────────────────────────────────────
+    required_paths = {c['dataset_path'] for c in pending_configs}
+    datasets_to_download = [ds for ds in base_config.get('datasets', [])
+                             if ds['path'] in required_paths]
+    download_config = {**base_config, 'datasets': datasets_to_download}
+    from dataset_manager import check_and_download_datasets_parallel
+    download_ok = check_and_download_datasets_parallel(
+        download_config, max_parallel=2, logger=logger)
+    if not download_ok:
+        logger.warning("Download incompleto al primo tentativo. Riprovo tra 60s...")
+        time.sleep(60)
+        download_ok = check_and_download_datasets_parallel(
+            download_config, max_parallel=2, logger=logger)
+    if not download_ok:
+        from dataset_manager import _dataset_exists as _has_imgs
+        failed_paths = {ds['path'] for ds in datasets_to_download
+                        if not _has_imgs(os.path.join(str(_PROJECT_ROOT), ds['path']))}
+        if failed_paths:
+            logger.warning(f"Dataset non disponibili: {failed_paths}. Rimosse le config corrispondenti.")
+            before = len(pending_configs)
+            pending_configs = [c for c in pending_configs if c['dataset_path'] not in failed_paths]
+            logger.warning(f"Config rimosse: {before - len(pending_configs)}. Rimangono: {len(pending_configs)}.")
+        if not pending_configs:
+            logger.error("Nessuna configurazione rimasta dopo rimozione dataset mancanti.")
+            sys.exit(1)
+
+    pre_download_model_weights(set(model_specific_search_space.keys()))
+
+    # ── Kill old FCGS instance ────────────────────────────────────────────
+    pid_file = str(_PROJECT_ROOT / 'fcgs.pid')
+    if os.path.exists(pid_file):
         try:
-            old_pid = int(open(_pid_file).read().strip())
+            old_pid = int(open(pid_file).read().strip())
             if old_pid != os.getpid():
-                print(f"[Startup] Found stale fcgs.pid ({old_pid}). Killing old process tree...")
+                print(f"[Startup] Stale fcgs.pid ({old_pid}). Killing old process tree...")
                 try:
                     import psutil as _psutil
                     try:
@@ -1111,9 +730,7 @@ def _main_body():
                         old_proc.kill()
                     except _psutil.NoSuchProcess:
                         pass
-                    print(f"[Startup] Old process tree killed.")
                 except ImportError:
-                    # fallback: platform kill
                     if sys.platform == 'win32':
                         subprocess.run(['taskkill', '/F', '/T', '/PID', str(old_pid)],
                                        capture_output=True)
@@ -1123,97 +740,80 @@ def _main_body():
                         except ProcessLookupError:
                             pass
         except Exception as _e:
-            print(f"[Startup] Could not kill old process from fcgs.pid: {_e}")
+            print(f"[Startup] Could not kill old process: {_e}")
 
-    with open(_pid_file, 'w') as _f:
-        _f.write(str(os.getpid()))
+    with open(pid_file, 'w') as f:
+        f.write(str(os.getpid()))
 
-    telegram_token = base_grid_config.get('telegram_bot_token', '')
-    telegram_chat_id = base_grid_config.get('telegram_chat_id', '')
-    notification_interval = int(base_grid_config.get('notification_interval', 10))
-    heavy_threshold = int(base_grid_config.get('heavy_client_threshold', HEAVY_CLIENT_THRESHOLD))
+    # ── Run ───────────────────────────────────────────────────────────────
+    telegram_token       = base_config.get('telegram_bot_token', '')
+    telegram_chat_id     = base_config.get('telegram_chat_id', '')
+    notification_interval = int(base_config.get('notification_interval', 10))
+    gpu_blacklist        = base_config.get('gpu_blacklist', [])
+    n_workers            = int(base_config.get('num_parallel_executions', 3))
+    start_time           = time.time()
 
-    completed_count = multiprocessing.Value('i', 0)
-    last_notified = multiprocessing.Value('i', 0)
-    error_count = multiprocessing.Value('i', 0)
-    fail_count = multiprocessing.Value('i', 0)
-    notify_lock = multiprocessing.Lock()
-    heavy_lock = multiprocessing.Lock()
-    heavy_running = multiprocessing.Value('i', 0)
-    active_normal_workers = multiprocessing.Value('i', 0)
-    start_time = time.time()
+    send_telegram(telegram_token, telegram_chat_id,
+                  f"<b>FCGS avviata</b>\n"
+                  f"Config: <b>{len(pending_configs)}</b>\n"
+                  f"Workers: {n_workers}",
+                  logger=logger)
 
-    num_workers = _compute_num_workers(base_grid_config)
+    completed = errors = 0
 
-    if telegram_token and telegram_chat_id:
-        send_telegram(telegram_token, telegram_chat_id,
-                      f"<b>FCGS avviata — {pc_name}</b>\n"
-                      f"Config da eseguire: <b>{configs_to_run_count}</b>\n"
-                      f"Workers paralleli: {num_workers}\n"
-                      f"Notifica ogni {notification_interval} completamenti.",
-                      logger=_main_logger)
-    # Pre-download weights for all models in the search space before spawning workers
-    pre_download_model_weights(set(model_specific_search_space.keys()))
+    pool = multiprocessing.Pool(
+        processes=n_workers,
+        initializer=_worker_init,
+        initargs=(gpu_blacklist,),
+    )
 
-    processes = []
-    print(f"\n=== Starting {num_workers} Grid Search workers ===")
-    base_port = base_grid_config['port']
-    gpu_blacklist = base_grid_config.get('gpu_blacklist', [])
-    worker_args = (task_queue, base_port, csv_lock, completed_count, last_notified,
-                   configs_to_run_count, start_time, notify_lock, notification_interval,
-                   telegram_token, telegram_chat_id, gpu_blacklist, error_count, fail_count,
-                   heavy_lock, heavy_running, active_normal_workers, heavy_threshold)
-    for i in range(num_workers):
-        process = multiprocessing.Process(target=run_grid_search_worker, args=(i, *worker_args))
-        processes.append(process)
-        process.start()
-
-    def _shutdown_all(signum=None, frame=None):
-        print("\n[FCGS] Signal received. Terminating all worker processes...")
-        for p in processes:
-            if p.is_alive():
-                p.kill()
+    def _shutdown(signum=None, frame=None):
+        logger.info("Shutdown signal received. Terminating pool...")
+        pool.terminate()
+        if os.path.exists(pid_file):
+            os.remove(pid_file)
         sys.exit(0)
 
-    _signal.signal(_signal.SIGTERM, _shutdown_all)
-    _signal.signal(_signal.SIGINT, _shutdown_all)
+    _signal.signal(_signal.SIGTERM, _shutdown)
+    _signal.signal(_signal.SIGINT,  _shutdown)
 
-    heartbeat_stop = threading.Event()
-    heartbeat_interval = int(base_grid_config.get('heartbeat_interval_hours', 4)) * 3600
-    if telegram_token and telegram_chat_id:
-        heartbeat_thread = threading.Thread(
-            target=_heartbeat_loop,
-            args=(telegram_token, telegram_chat_id, completed_count, configs_to_run_count,
-                  start_time, pc_name, heartbeat_interval, heartbeat_stop,
-                  error_count, fail_count, _main_logger),
-            daemon=True
-        )
-        heartbeat_thread.start()
+    try:
+        for run_summary in pool.imap_unordered(run_single_experiment, pending_configs):
+            if run_summary:
+                append_results_to_csv(shared_csv_path, run_summary)
+            else:
+                errors += 1
+            completed += 1
+            logger.info(f"[{completed}/{len(pending_configs)}] Done. Errors so far: {errors}")
 
-    task_queue.join()
-    heartbeat_stop.set()
-    for _ in range(num_workers):
-        task_queue.put(None)
-    for process in processes:
-        process.join()
-
-    if os.path.exists(_pid_file):
-        os.remove(_pid_file)
+            if completed % notification_interval == 0:
+                elapsed   = time.time() - start_time
+                remaining = len(pending_configs) - completed
+                eta       = (elapsed / completed) * remaining if completed else 0
+                send_telegram(telegram_token, telegram_chat_id,
+                              f"<b>FCGS Progress</b>\n"
+                              f"Completate: {completed}/{len(pending_configs)}\n"
+                              f"Errori: {errors}\n"
+                              f"ETA: {_format_duration(eta)}",
+                              logger=logger)
+    finally:
+        pool.close()
+        pool.join()
 
     elapsed = time.time() - start_time
-    print("\n=== All parallel executions have finished. ===")
-    if telegram_token and telegram_chat_id:
-        send_telegram(telegram_token, telegram_chat_id,
-                      f"<b>FCGS completata — {pc_name}</b>\n"
-                      f"Config eseguite: {completed_count.value}/{configs_to_run_count}\n"
-                      f"Tempo totale: {_format_duration(elapsed)}",
-                      logger=_main_logger)
+    send_telegram(telegram_token, telegram_chat_id,
+                  f"<b>FCGS completata</b>\n"
+                  f"Completate: {completed}/{len(pending_configs)}\n"
+                  f"Errori: {errors}\n"
+                  f"Tempo: {_format_duration(elapsed)}",
+                  logger=logger)
+
+    if os.path.exists(pid_file):
+        os.remove(pid_file)
+
+    logger.info("=== FCGS Grid Search Complete ===")
 
 
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser()
-    parser.add_argument('config', nargs='?', type=str, default=GRID_SEARCH_CONFIG_PATH)
-    args = parser.parse_args()
-    GRID_SEARCH_CONFIG_PATH = args.config
     multiprocessing.set_start_method('spawn', force=True)
     main()
