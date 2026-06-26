@@ -481,7 +481,6 @@ def run_single_experiment(config: Dict) -> Optional[Dict]:
         server_process = multiprocessing.Process(
             target=_server_process_target,
             args=(config, result_queue),
-            daemon=True,
         )
         server_process.start()
 
