@@ -526,12 +526,20 @@ def run_single_experiment(config: Dict) -> Optional[Dict]:
 # ---------------------------------------------------------------------------
 
 def main():
-    if not os.path.exists(GRID_SEARCH_CONFIG_PATH):
-        print(f"ERRORE: config non trovata: {GRID_SEARCH_CONFIG_PATH}")
+    parser = argparse.ArgumentParser(description='FCGS Federated Grid Search')
+    parser.add_argument(
+        'config', nargs='?', default=GRID_SEARCH_CONFIG_PATH,
+        help=f'File di configurazione JSON (default: {GRID_SEARCH_CONFIG_PATH})'
+    )
+    args = parser.parse_args()
+    config_path = args.config
+
+    if not os.path.exists(config_path):
+        print(f"ERRORE: config non trovata: {config_path}")
         sys.exit(1)
 
-    print(f"=== Configurazione: {GRID_SEARCH_CONFIG_PATH} ===")
-    base_config = load_json(GRID_SEARCH_CONFIG_PATH)
+    print(f"=== Configurazione: {config_path} ===")
+    base_config = load_json(config_path)
 
     pc_name = _socket.gethostname()
     _pc_results_dir = f"results/results_{pc_name}"
