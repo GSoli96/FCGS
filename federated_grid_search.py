@@ -417,18 +417,29 @@ def _cleanup_after_task(server_process: multiprocessing.Process, port: int,
 
 
 # ---------------------------------------------------------------------------
-# Pool worker initializer — assegna GPU in base al PID
+# Pool worker initializer — assegna GPU e port-base stabili per worker
 # ---------------------------------------------------------------------------
 
-def _worker_init(gpu_blacklist: list) -> None:
+_WORKER_PORT_BASE: int = 0  # impostato da _worker_init; ogni worker ha il suo valore
+
+
+def _worker_init(gpu_blacklist: list,
+                 slot_counter: multiprocessing.Value,
+                 slot_lock: multiprocessing.Lock,
+                 port_base: int) -> None:
+    global _WORKER_PORT_BASE
+    with slot_lock:
+        slot = slot_counter.value
+        slot_counter.value += 1
+    _WORKER_PORT_BASE = port_base + slot * 20  # 20 porte per worker, nessuna sovrapposizione
     try:
         import torch as _t
         if _t.cuda.is_available():
             usable = [i for i in range(_t.cuda.device_count()) if i not in (gpu_blacklist or [])]
             if usable:
-                gpu_idx = os.getpid() % len(usable)
+                gpu_idx = slot % len(usable)
                 os.environ['CUDA_VISIBLE_DEVICES'] = str(usable[gpu_idx])
-                print(f"[Worker PID {os.getpid()}] GPU {usable[gpu_idx]} assigned.")
+                print(f"[Worker slot={slot} PID={os.getpid()}] GPU {usable[gpu_idx]} assigned, port base {_WORKER_PORT_BASE}")
     except Exception:
         pass
 
@@ -464,7 +475,8 @@ def run_single_experiment(config: Dict) -> Optional[Dict]:
     try:
         print(f"[{dataset_name}|{model_name}] START")
 
-        # Port selection
+        # Port selection — usa il base-port dedicato al worker per evitare race condition
+        config['port'] = _WORKER_PORT_BASE
         for _retry in range(5):
             config['port'] = find_free_port(config['ip_address'], config['port'])
             time.sleep(0.1 * (_retry + 1))
@@ -563,12 +575,15 @@ def main():
     base_config = load_json(config_path)
 
     pc_name = _socket.gethostname()
-    _pc_results_dir = f"results/results_{pc_name}"
+    config_stem = Path(config_path).stem  # es. "grid_search_config_NoHE_1"
+    config_tag  = config_stem.replace('grid_search_config', '').strip('_')
+    _run_id     = f"{pc_name}_{config_tag}" if config_tag else pc_name
+    _pc_results_dir = f"results/results_{_run_id}"
     base_config['base_csv_path']        = f"{_pc_results_dir}/csv"
     base_config['base_log_path']        = f"{_pc_results_dir}/log"
     base_config['base_plot_path']       = f"{_pc_results_dir}/plots"
     base_config['base_split_data_path'] = f"{_pc_results_dir}/run_dataset"
-    base_config['pc_name']              = pc_name
+    base_config['pc_name']              = _run_id
 
     _base_csv   = base_config['base_csv_path']
     _base_log   = base_config['base_log_path']
@@ -751,10 +766,14 @@ def main():
     logger.info(f"Avvio grid search: {len(pending_configs)} config, {n_workers} worker(s)")
     completed = errors = 0
 
+    _slot_counter = multiprocessing.Value('i', 0)
+    _slot_lock    = multiprocessing.Lock()
+    _port_base    = int(base_config.get('port', 5001))
+
     pool = _NoDaemonPool(
         processes=n_workers,
         initializer=_worker_init,
-        initargs=(gpu_blacklist,),
+        initargs=(gpu_blacklist, _slot_counter, _slot_lock, _port_base),
     )
 
     def _shutdown(signum=None, frame=None):

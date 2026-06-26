@@ -3,7 +3,7 @@
   "port": 5001,
   "hf_repo_id": "Siando/fcgs-datasets",
   "gpu_blacklist": [],
-  "num_parallel_executions": 1,
+  "num_parallel_executions": 2,
   "base_csv_path": "results/csv",
   "base_log_path": "results/log",
   "heavy_client_threshold": 8,
