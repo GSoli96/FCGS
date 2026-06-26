@@ -1,0 +1,186 @@
+{
+  "ip_address": "127.0.0.1",
+  "port": 5001,
+  "hf_repo_id": "Siando/fcgs-datasets",
+  "gpu_blacklist": [],
+  "num_parallel_executions": 1,
+  "base_csv_path": "results/csv",
+  "base_log_path": "results/log",
+  "heavy_client_threshold": 8,
+  "base_plot_path": "static/plots",
+  "base_split_data_path": "results/run_dataset",
+  "round_timeout": 1800,
+  "server_startup_timeout": 600,
+  "server_ready_timeout": 180,
+  "server_join_timeout": 300,
+  "early_stop_patience": 5,
+  "weighted_aggregation": true,
+  "datasets": [
+    {
+      "name": "brain_tumor",
+      "path": "dbluigi/brain_tumor/train",
+      "num_classes": 4,
+      "num_images": 5723
+    },
+    {
+      "name": "dataset_HAM1000",
+      "path": "dbluigi/dataset_HAM1000/dataset",
+      "num_classes": 2,
+      "num_images": 4499
+    },
+    {
+      "name": "dataset_ISIC",
+      "path": "dbluigi/dataset_ISIC/dataset",
+      "num_classes": 2,
+      "num_images": 2022
+    },
+    {
+      "name": "dataset_ISIC2",
+      "path": "dbluigi/dataset_ISIC2",
+      "num_classes": 2,
+      "num_images": 12022
+    },
+    {
+      "name": "dataset_RD_colored",
+      "path": "dbluigi/dataset_RD/colored_images",
+      "num_classes": 3,
+      "num_images": 1562
+    },
+    {
+      "name": "dataset_RD_colored_1",
+      "path": "dbluigi/dataset_RD/colored_images_1",
+      "num_classes": 2,
+      "num_images": 2100
+    },
+    {
+      "name": "dataset_RD_kdr299",
+      "path": "dbluigi/dataset_RD/kdr299_iimp",
+      "num_classes": 3,
+      "num_images": 1562
+    },
+    {
+      "name": "dataset_RD_kdr299_1",
+      "path": "dbluigi/dataset_RD/kdr299_iimp_1",
+      "num_classes": 2,
+      "num_images": 2100
+    }
+  ],
+  "common_search_space": {
+    "encryption_mode": [
+      "no_encryption"
+    ],
+    "he_backend": [
+      "ckks"
+    ],
+    "device": [
+      "cuda"
+    ],
+    "global_epoch": [
+      5,
+      10,
+      20,
+      30
+    ],
+    "local_epoch": [
+      2,
+      5
+    ],
+    "num_clients": [
+      2,
+      4,
+      8,
+      16,
+      32
+    ],
+    "models_percentage": [
+      1
+    ],
+    "learning_rate": [
+      0.001
+    ],
+    "batch_size": [
+      16
+    ],
+    "aggregation_algorithm": [
+      "FedAvg",
+      "FedProx"
+    ],
+    "fedprox_mu": [
+      0.05
+    ]
+  },
+  "model_specific_search_space": {
+    "GoogLeNet": {
+      "image_size": [
+        128,
+        224
+      ],
+      "num_custom_layers": [
+        2,
+        4
+      ]
+    },
+    "AlexNet": {
+      "image_size": [
+        128,
+        224
+      ],
+      "num_custom_layers": [
+        2,
+        4
+      ]
+    },
+    "ConvNet": {
+      "image_size": [
+        128,
+        224
+      ],
+      "convnet_hidden1": [
+        32
+      ],
+      "convnet_hidden2": [
+        16
+      ]
+    },
+    "ResNet18": {
+      "image_size": [
+        128,
+        224
+      ],
+      "num_custom_layers": [
+        2,
+        4
+      ]
+    },
+    "ResNet34": {
+      "image_size": [
+        128,
+        224
+      ],
+      "num_custom_layers": [
+        2,
+        4
+      ]
+    },
+    "ResNet50": {
+      "image_size": [
+        128,
+        224
+      ],
+      "num_custom_layers": [
+        2,
+        4
+      ]
+    },
+    "ResNet101": {
+      "image_size": [
+        128,
+        224
+      ],
+      "num_custom_layers": [
+        2,
+        4
+      ]
+    }
+  }
+}
