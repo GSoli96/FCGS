@@ -20,9 +20,30 @@ import csv
 import os
 from typing import Dict, List, Any, Generator, Set, FrozenSet, Tuple, Optional
 import multiprocessing
+import multiprocessing.pool
 
 import federated_server
 import run_multiple_clients
+
+
+# Pool con worker non-daemon: i Pool standard hanno worker daemon che non possono
+# creare processi figli. Questa subclass aggira il limite mantenendo l'intera
+# interfaccia di Pool (imap_unordered, initializer, ecc.).
+class _NoDaemonProcess(multiprocessing.Process):
+    @property
+    def daemon(self):
+        return False
+
+    @daemon.setter
+    def daemon(self, value):
+        pass
+
+
+class _NoDaemonPool(multiprocessing.pool.Pool):
+    def Process(self, *args, **kwds):
+        proc = super().Process(*args, **kwds)
+        proc.__class__ = _NoDaemonProcess
+        return proc
 
 _PROJECT_ROOT = Path(__file__).parent
 _CONFIGS_DIR = _PROJECT_ROOT / 'configs'
@@ -730,7 +751,7 @@ def main():
     logger.info(f"Avvio grid search: {len(pending_configs)} config, {n_workers} worker(s)")
     completed = errors = 0
 
-    pool = multiprocessing.Pool(
+    pool = _NoDaemonPool(
         processes=n_workers,
         initializer=_worker_init,
         initargs=(gpu_blacklist,),
