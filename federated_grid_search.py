@@ -44,36 +44,6 @@ def _format_duration(seconds: float) -> str:
     return f"{s}s"
 
 
-def _safe_print(text: str) -> None:
-    try:
-        print(text)
-    except UnicodeEncodeError:
-        try:
-            sys.stdout.buffer.write((text + '\n').encode('utf-8'))
-            sys.stdout.buffer.flush()
-        except Exception:
-            print(text.encode('ascii', errors='replace').decode('ascii'))
-
-
-def send_telegram(token: str, chat_id: str, message: str, logger=None) -> None:
-    clean = re.sub(r'<[^>]+>', '', message).strip()
-    log_line = f"[Telegram] {clean}"
-    if logger:
-        logger.info(log_line)
-    else:
-        _safe_print(log_line)
-    if not token or not chat_id:
-        return
-    try:
-        url = f"https://api.telegram.org/bot{token}/sendMessage"
-        requests.post(url, data={"chat_id": chat_id, "text": message, "parse_mode": "HTML"}, timeout=10)
-    except Exception as e:
-        err = f"[Notifier] Telegram error: {e}"
-        if logger:
-            logger.error(err)
-        else:
-            _safe_print(err)
-
 
 def _setup_main_logger(base_log_path: str) -> logging.Logger:
     logger = logging.getLogger("FCGS-Main")
@@ -746,19 +716,11 @@ def main():
         f.write(str(os.getpid()))
 
     # ── Run ───────────────────────────────────────────────────────────────
-    telegram_token       = base_config.get('telegram_bot_token', '')
-    telegram_chat_id     = base_config.get('telegram_chat_id', '')
-    notification_interval = int(base_config.get('notification_interval', 10))
-    gpu_blacklist        = base_config.get('gpu_blacklist', [])
-    n_workers            = int(base_config.get('num_parallel_executions', 3))
-    start_time           = time.time()
+    gpu_blacklist = base_config.get('gpu_blacklist', [])
+    n_workers     = int(base_config.get('num_parallel_executions', 3))
+    start_time    = time.time()
 
-    send_telegram(telegram_token, telegram_chat_id,
-                  f"<b>FCGS avviata</b>\n"
-                  f"Config: <b>{len(pending_configs)}</b>\n"
-                  f"Workers: {n_workers}",
-                  logger=logger)
-
+    logger.info(f"Avvio grid search: {len(pending_configs)} config, {n_workers} worker(s)")
     completed = errors = 0
 
     pool = multiprocessing.Pool(
@@ -785,28 +747,13 @@ def main():
                 errors += 1
             completed += 1
             logger.info(f"[{completed}/{len(pending_configs)}] Done. Errors so far: {errors}")
-
-            if completed % notification_interval == 0:
-                elapsed   = time.time() - start_time
-                remaining = len(pending_configs) - completed
-                eta       = (elapsed / completed) * remaining if completed else 0
-                send_telegram(telegram_token, telegram_chat_id,
-                              f"<b>FCGS Progress</b>\n"
-                              f"Completate: {completed}/{len(pending_configs)}\n"
-                              f"Errori: {errors}\n"
-                              f"ETA: {_format_duration(eta)}",
-                              logger=logger)
     finally:
         pool.close()
         pool.join()
 
     elapsed = time.time() - start_time
-    send_telegram(telegram_token, telegram_chat_id,
-                  f"<b>FCGS completata</b>\n"
-                  f"Completate: {completed}/{len(pending_configs)}\n"
-                  f"Errori: {errors}\n"
-                  f"Tempo: {_format_duration(elapsed)}",
-                  logger=logger)
+    logger.info(f"=== Grid search completata: {completed}/{len(pending_configs)} config, "
+                f"{errors} errori, tempo: {_format_duration(elapsed)} ===")
 
     if os.path.exists(pid_file):
         os.remove(pid_file)
